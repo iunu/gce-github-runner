@@ -367,3 +367,4 @@ case "$command" in
     usage
     exit 1
     ;;
+esac

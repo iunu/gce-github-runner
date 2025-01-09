@@ -30,7 +30,7 @@ inputs:
     required: true
   machine_zone:
     description: GCE zone
-    default: "us-east1-c"
+    default: "us-central1-c"
     required: true
   machine_type:
     description: GCE machine type; https://cloud.google.com/compute/docs/machine-types

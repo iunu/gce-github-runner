@@ -86,6 +86,10 @@ inputs:
     description: "Shutdown grace period (in seconds)."
     default: 30
     required: true
+  finish_timeout:
+    description: "Manual shutdown grace period (in seconds) if called."
+    default: 30
+    required: true
   actions_preinstalled:
     description: "Whether the GitHub actions have already been installed at `/actions-runner`."
     default: false
@@ -128,6 +132,7 @@ runs:
         --disk_size=${{ inputs.disk_size }}
         --scopes=${{ inputs.scopes }}
         --shutdown_timeout=${{ inputs.shutdown_timeout }}
+        --finish_timeout=${{ inputs.finish_timeout }}
         --runner_service_account=${{ inputs.runner_service_account }}
         --image_project=${{ inputs.image_project }}
         --image=${{ inputs.image }}

@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - iunu
 
 jobs:
   create-runner:
@@ -13,7 +14,7 @@ jobs:
       label: ${{ steps.create-runner.outputs.label }}
     steps:
       - id: create-runner
-        uses: related-sciences/gce-github-runner@main
+        uses: iunu/gce-github-runner@iunu
         with:
           token: ${{ secrets.GH_SA_TOKEN }}
           project_id: ${{ secrets.GCP_PROJECT_ID }}
@@ -30,3 +31,8 @@ jobs:
     runs-on: ${{ needs.create-runner.outputs.label }}
     steps:
       - run: echo "This runs on the GCE runner VM"
+      - uses: iunu/gce-github-runner@iunu
+        with:
+          command: stop
+          finish_timeout: ${{ inputs.shutdown_timeout }}
+        if: always()

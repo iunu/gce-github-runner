@@ -5,11 +5,11 @@ on:
     inputs:
       machine_zone:
         description: GCE zone
-        default: "us-east1-c"
+        default: "us-central1-c"
         required: true
       machine_type:
         description: "GCE machine type: https://cloud.google.com/compute/docs/machine-types"
-        default: "n1-standard-4"
+        default: "t2d-standard-1"
         required: true
       disk_size:
         description: VM disk size.
@@ -19,11 +19,15 @@ on:
         required: false
       shutdown_timeout:
         description: "Shutdown grace period (in seconds)."
+        default: 60
+        required: true
+      finish_timeout:
+        description: "Shutdown grace period (in seconds) when manually stopped."
         default: 30
         required: true
       no_external_address:
         description: Disables external IP address for the worker
-        default: false
+        default: true
         required: true
       actions_preinstalled:
         description: "Whether the GitHub actions have already been installed at `/actions-runner`."
@@ -37,7 +41,7 @@ jobs:
       label: ${{ steps.create-runner.outputs.label }}
     steps:
       - id: create-runner
-        uses: related-sciences/gce-github-runner@main
+        uses: iunu/gce-github-runner@iunu
         with:
           token: ${{ secrets.GH_SA_TOKEN }}
           project_id: ${{ secrets.GCP_PROJECT_ID }}
@@ -51,9 +55,15 @@ jobs:
           no_external_address: ${{ inputs.no_external_address }}
           actions_preinstalled: ${{ inputs.actions_preinstalled }}
           shutdown_timeout: ${{ inputs.shutdown_timeout }}
+          finish_timeout: ${{ inputs.finish_timeout }}
 
   test:
     needs: create-runner
     runs-on: ${{ needs.create-runner.outputs.label }}
     steps:
       - run: echo "This runs on the GCE runner VM"
+      - uses: iunu/gce-github-runner@iunu
+        with:
+          command: stop
+          shutdown_timeout: ${{ inputs.finish_timeout }}
+        if: always()

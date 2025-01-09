@@ -32,6 +32,7 @@ image_family=
 network=
 scopes=
 shutdown_timeout=
+finish_timeout=
 subnet=
 preemptible=
 ephemeral=
@@ -60,6 +61,7 @@ while getopts_long :h opt \
   network optional_argument \
   scopes required_argument \
   shutdown_timeout required_argument \
+  finish_timeout required_argument \
   subnet optional_argument \
   preemptible required_argument \
   ephemeral required_argument \
@@ -119,6 +121,9 @@ do
       ;;
     shutdown_timeout)
       shutdown_timeout=$OPTLARG
+      ;;
+    finish_timeout)
+      finish_timeout=$OPTLARG
       ;;
     subnet)
       subnet=${OPTLARG-$subnet}
@@ -201,28 +206,28 @@ function start_vm {
 	# Create a systemd service in charge of shutting down the machine once the workflow has finished
 	cat <<-EOF > /etc/systemd/system/shutdown.sh
 	#!/bin/sh
-	sleep ${shutdown_timeout}
+	sleep $/{1}
 	gcloud compute instances delete $VM_ID --zone=$machine_zone --quiet
 	EOF
 
 	cat <<-EOF > /etc/systemd/system/shutdown.service
 	[Unit]
-	Description=Shutdown service
+	Description=Shutdown service in %i Seconds
 	[Service]
-	ExecStart=/etc/systemd/system/shutdown.sh
+	ExecStart=/etc/systemd/system/shutdown.sh %i
 	[Install]
 	WantedBy=multi-user.target
 	EOF
 
 	chmod +x /etc/systemd/system/shutdown.sh
 	systemctl daemon-reload
-	systemctl enable shutdown.service
+	systemctl enable shutdown@${shutdown_timeout}.service
 
 	cat <<-EOF > /usr/bin/gce_runner_shutdown.sh
 	#!/bin/sh
 	echo \"✅ Self deleting $VM_ID in ${machine_zone} in ${shutdown_timeout} seconds ...\"
 	# We tear down the machine by starting the systemd service that was registered by the startup script
-	systemctl start shutdown.service
+	systemctl start shutdown@${shutdown_timeout}.service
 	EOF
 
 	# See: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job
@@ -232,8 +237,8 @@ function start_vm {
 	./svc.sh install && \\
 	./svc.sh start && \\
 	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=1
-	# 3 days represents the max workflow runtime. This will shutdown the instance if everything else fails.
-	nohup sh -c \"sleep 3d && gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}\" > /dev/null &
+	# 3 days represents the max workflow runtime. We're using 1 day as nothing should run that long before an runner is deleted
+	nohup sh -c \"sleep 1d && gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}\" > /dev/null &
   "
 
   if $actions_preinstalled ; then
@@ -335,14 +340,30 @@ function start_vm {
   fi
 }
 
+function stop_vm {
+  # NOTE: this function runs on the GCE VM
+  echo "Stopping GCE VM ..."
+  # NOTE: it would be nice to gracefully shut down the runner, but we actually don't need
+  #       to do that. VM shutdown will disconnect the runner, and GH will unregister it
+  #       in 30 days
+  # TODO: RUNNER_ALLOW_RUNASROOT=1 /actions-runner/config.sh remove --token $TOKEN
+  NAME=$(curl -S -s -X GET http://metadata.google.internal/computeMetadata/v1/instance/name -H 'Metadata-Flavor: Google')
+  ZONE=$(curl -S -s -X GET http://metadata.google.internal/computeMetadata/v1/instance/zone -H 'Metadata-Flavor: Google')
+  echo "✅ Self deleting $NAME in $ZONE in ${finish_timeout} seconds ..."
+  # We tear down the machine by starting the systemd service that was registered by the startup script
+  systemctl start shutdown@${finish_timeout}.service
+}
+
 safety_on
 case "$command" in
   start)
     start_vm
     ;;
+  stop)
+    stop_vm ${finish_timeout}
+    ;;
   *)
-    echo "Invalid command: \`${command}\`, valid values: start" >&2
+    echo "Invalid command: \`${command}\`, valid values: start|stop" >&2
     usage
     exit 1
     ;;
-esac

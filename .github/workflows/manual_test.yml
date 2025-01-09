@@ -43,13 +43,16 @@ jobs:
       - id: create-runner
         uses: iunu/gce-github-runner@iunu
         with:
-          token: ${{ secrets.GH_SA_TOKEN }}
+          token: ${{ secrets.GH_PAT_TOKEN }}
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           service_account_key: ${{ secrets.GCP_SA_KEY }}
           machine_zone: ${{ inputs.machine_zone }}
           machine_type: ${{ inputs.machine_type }}
           disk_size: ${{ inputs.disk_size }}
           runner_service_account: ${{ inputs.runner_service_account }}
+          network: 'runner-net'
+          subnet: 'runner-subnet'
+          preemptible: true
           image_project: ubuntu-os-cloud
           image_family: ubuntu-2004-lts
           no_external_address: ${{ inputs.no_external_address }}

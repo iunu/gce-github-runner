@@ -16,14 +16,17 @@ jobs:
       - id: create-runner
         uses: iunu/gce-github-runner@iunu
         with:
-          token: ${{ secrets.GH_SA_TOKEN }}
+          token: ${{ secrets.GH_PAT_TOKEN }}
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           service_account_key: ${{ secrets.GCP_SA_KEY }}
+          machine_zone: 'us-central1-c'
+          machine_type: 't2d-standard-1'
           image_project: ubuntu-os-cloud
           image_family: ubuntu-2004-lts
-          # NOTE: if you do not want external IPs, you must configure your GCE project
-          #       to allow access to the Internet e.g. via Cloud NAT, if you are fine
-          #       with external IPs, no_external_address should be false (default).
+          network: 'runner-net'
+          subnet: 'runner-subnet'
+          preemptible: true
+          actions_preinstalled: false
           no_external_address: true
 
   test:

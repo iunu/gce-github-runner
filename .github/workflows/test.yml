@@ -2,20 +2,10 @@ name: Test
 
 on:
   workflow_dispatch:
-    inputs:
-      finish_timeout:
-        description: "Shutdown grace period (in seconds) when manually stopped."
-        default: 30
-        required: false
   push:
     branches:
       - main
       - iunu
-    inputs:
-      finish_timeout:
-        description: "Shutdown grace period (in seconds) when manually stopped."
-        default: 30
-        required: false
 
 jobs:
   create-runner:
@@ -47,5 +37,5 @@ jobs:
       - uses: iunu/gce-github-runner@iunu
         with:
           command: stop
-          finish_timeout: 30
+          #finish_timeout: 30
         if: always()

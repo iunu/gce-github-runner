@@ -88,7 +88,7 @@ inputs:
     required: true
   shutdown_timeout:
     description: "Shutdown grace period (in seconds)."
-    default: 30
+    default: 60
     required: true
   finish_timeout:
     description: "Manual 'shutdown' commands grace period (in seconds) if called."

@@ -58,7 +58,6 @@ jobs:
           no_external_address: ${{ inputs.no_external_address }}
           actions_preinstalled: ${{ inputs.actions_preinstalled }}
           shutdown_timeout: ${{ inputs.shutdown_timeout }}
-          finish_timeout: ${{ inputs.finish_timeout }}
 
   test:
     needs: create-runner
@@ -68,5 +67,5 @@ jobs:
       - uses: iunu/gce-github-runner@iunu
         with:
           command: stop
-          shutdown_timeout: ${{ inputs.finish_timeout }}
+          finish_timeout: ${{ inputs.finish_timeout }}
         if: always()

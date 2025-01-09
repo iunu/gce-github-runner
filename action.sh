@@ -349,9 +349,9 @@ function stop_vm {
   # TODO: RUNNER_ALLOW_RUNASROOT=1 /actions-runner/config.sh remove --token $TOKEN
   NAME=$(curl -S -s -X GET http://metadata.google.internal/computeMetadata/v1/instance/name -H 'Metadata-Flavor: Google')
   ZONE=$(curl -S -s -X GET http://metadata.google.internal/computeMetadata/v1/instance/zone -H 'Metadata-Flavor: Google')
-  echo "✅ Self deleting $NAME in $ZONE in ${finish_timeout} seconds ..."
+  echo "✅ Self deleting $NAME in $ZONE in ${1} seconds ..."
   # We tear down the machine by starting the systemd service that was registered by the startup script
-  systemctl start shutdown@${finish_timeout}.service
+  systemctl start shutdown@${1}.service
 }
 
 safety_on

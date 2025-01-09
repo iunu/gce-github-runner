@@ -2,10 +2,20 @@ name: Test
 
 on:
   workflow_dispatch:
+    inputs:
+      finish_timeout:
+        description: "Shutdown grace period (in seconds) when manually stopped."
+        default: 30
+        required: true
   push:
     branches:
       - main
       - iunu
+    inputs:
+      finish_timeout:
+        description: "Shutdown grace period (in seconds) when manually stopped."
+        default: 30
+        required: true
 
 jobs:
   create-runner:

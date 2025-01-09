@@ -22,7 +22,7 @@ jobs:
           machine_zone: 'us-central1-c'
           machine_type: 't2d-standard-1'
           image_project: ubuntu-os-cloud
-          image_family: ubuntu-2004-lts
+          image_family: ubuntu-2404-lts
           network: 'runner-net'
           subnet: 'runner-subnet'
           preemptible: true
@@ -37,5 +37,4 @@ jobs:
       - uses: iunu/gce-github-runner@iunu
         with:
           command: stop
-          #finish_timeout: 30
         if: always()

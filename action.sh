@@ -210,7 +210,7 @@ function start_vm {
 	gcloud compute instances delete $VM_ID --zone=$machine_zone --quiet
 	EOF
 
-	cat <<-EOF > /etc/systemd/system/shutdown.service
+	cat <<-EOF > /etc/systemd/system/shutdown\@.service
 	[Unit]
 	Description=Shutdown service in %i Seconds
 	[Service]

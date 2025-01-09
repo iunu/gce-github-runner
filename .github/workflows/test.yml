@@ -6,7 +6,7 @@ on:
       finish_timeout:
         description: "Shutdown grace period (in seconds) when manually stopped."
         default: 30
-        required: true
+        required: false
   push:
     branches:
       - main
@@ -15,7 +15,7 @@ on:
       finish_timeout:
         description: "Shutdown grace period (in seconds) when manually stopped."
         default: 30
-        required: true
+        required: false
 
 jobs:
   create-runner:

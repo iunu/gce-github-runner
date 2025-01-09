@@ -47,5 +47,5 @@ jobs:
       - uses: iunu/gce-github-runner@iunu
         with:
           command: stop
-          finish_timeout: ${{ inputs.finish_timeout }}
+          finish_timeout: 30
         if: always()

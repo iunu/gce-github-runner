@@ -206,7 +206,7 @@ function start_vm {
 	# Create a systemd service in charge of shutting down the machine once the workflow has finished
 	cat <<-EOF > /etc/systemd/system/shutdown.sh
 	#!/bin/sh
-	sleep $/{1}
+	sleep \${1}
 	gcloud compute instances delete $VM_ID --zone=$machine_zone --quiet
 	EOF
 

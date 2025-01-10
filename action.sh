@@ -221,7 +221,6 @@ function start_vm {
 
 	chmod +x /etc/systemd/system/shutdown.sh
 	systemctl daemon-reload
-	systemctl enable shutdown@${shutdown_timeout}.service
 
 	cat <<-EOF > /usr/bin/gce_runner_shutdown.sh
 	#!/bin/sh
@@ -230,8 +229,16 @@ function start_vm {
 	systemctl start shutdown@${shutdown_timeout}.service
 	EOF
 
+	cat <<-EOF > /usr/bin/gce_cancel_shutdown.sh
+	#!/bin/sh
+	echo \"✅ Cancelling deletion of $VM_ID in ${machine_zone}!\"
+	# Stop the shutdown script
+	systemctl stop shutdown@${shutdown_timeout}.service
+	EOF
+
 	# See: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job
 	echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/bin/gce_runner_shutdown.sh" >.env
+  echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/bin/gce_cancel_shutdown.sh" >.env
 	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \\
 	RUNNER_ALLOW_RUNASROOT=1 ./config.sh --url https://github.com/${GITHUB_REPOSITORY} --token ${RUNNER_TOKEN} --labels ${VM_ID} --unattended ${ephemeral_flag} --disableupdate && \\
 	./svc.sh install && \\

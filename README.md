@@ -21,7 +21,7 @@ jobs:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           service_account_key: ${{ secrets.GCP_SA_KEY }}
           image_project: ubuntu-os-cloud
-          image_family: ubuntu-2404-lts
+          image_family: ubuntu-2404-lts-amd64
 
   test:
     needs: create-runner

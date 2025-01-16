@@ -28,12 +28,24 @@ jobs:
           preemptible: true
           actions_preinstalled: false
           no_external_address: true
+          shutdown_timeout: 30
 
-  test:
+  test1:
     needs: create-runner
     runs-on: ${{ needs.create-runner.outputs.label }}
     steps:
-      - run: echo "This runs on the GCE runner VM"
+      - name: Job 1 Test 
+        run: echo "This runs on the GCE runner VM"
+
+  test2:
+    needs: create-runner
+    runs-on: ${{ needs.create-runner.outputs.label }}
+    steps:
+      - name: Wait for longer than shutdown timeout
+        run: sleep 60 #Give time for runner to shutdown from shutdown timeout
+
+      - name: Job 2 Test
+        run: echo "This also runs on the GCE runner VM"
       - uses: iunu/gce-github-runner@iunu
         with:
           command: stop

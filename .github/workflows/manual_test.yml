@@ -19,7 +19,7 @@ on:
         required: false
       shutdown_timeout:
         description: "Shutdown grace period (in seconds)."
-        default: 60
+        default: 30
         required: true
       finish_timeout:
         description: "Shutdown grace period (in seconds) when manually stopped."
@@ -59,13 +59,25 @@ jobs:
           actions_preinstalled: ${{ inputs.actions_preinstalled }}
           shutdown_timeout: ${{ inputs.shutdown_timeout }}
 
-  test:
+  test1:
     needs: create-runner
     runs-on: ${{ needs.create-runner.outputs.label }}
     steps:
-      - run: echo "This runs on the GCE runner VM"
+      - name: Job 1 Test 
+        run: echo "This runs on the GCE runner VM"
+
+  test2:
+    needs: 
+      - create-runner
+      - test1
+    runs-on: ${{ needs.create-runner.outputs.label }}
+    steps:
+      - name: Wait for longer than shutdown timeout
+        run: sleep 60 #Give time for runner to shutdown from shutdown timeout
+
+      - name: Job 2 Test
+        run: echo "This also runs on the GCE runner VM"
       - uses: iunu/gce-github-runner@iunu
         with:
           command: stop
-          finish_timeout: ${{ inputs.finish_timeout }}
         if: always()

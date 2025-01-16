@@ -47,7 +47,6 @@ jobs:
       - name: Job 2 Test
         run: echo "This also runs on the GCE runner VM"
       - uses: iunu/gce-github-runner@iunu
-# See if this works without specifying stop command
-#        with:
-#          command: stop
-#        if: always()
+        with:
+          command: stop
+        if: always()

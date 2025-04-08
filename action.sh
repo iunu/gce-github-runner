@@ -244,8 +244,8 @@ function start_vm {
 	./svc.sh install && \\
 	./svc.sh start && \\
 	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=1
-	# 3 days represents the max workflow runtime. We're using 1 day as nothing should run that long before an runner is deleted
-	nohup sh -c \"sleep 1d && gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}\" > /dev/null &
+	# 3 days represents the max workflow runtime. We're using 1 hour as nothing should run that long before an runner is deleted
+	nohup sh -c \"sleep 1h && gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}\" > /dev/null &
   "
 
   if $actions_preinstalled ; then

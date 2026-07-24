@@ -94,6 +94,13 @@ inputs:
     description: "Manual 'shutdown' commands grace period (in seconds) if called."
     default: 30
     required: true
+  deletion_timeout:
+    description: >-
+      Safety-net VM deletion timeout (in seconds), used if the shutdown-hook mechanism fails to tear down the VM.
+      Clamped to 86400 (24h) when preemptible=true (GCE's hard preemptible limit), and to 259200 (3 days) in all cases
+      (GitHub Actions' max workflow runtime).
+    default: 3600
+    required: true
   actions_preinstalled:
     description: "Whether the GitHub actions have already been installed at `/actions-runner`."
     default: false
@@ -137,6 +144,7 @@ runs:
         --scopes=${{ inputs.scopes }}
         --shutdown_timeout=${{ inputs.shutdown_timeout }}
         --finish_timeout=${{ inputs.finish_timeout }}
+        --deletion_timeout=${{ inputs.deletion_timeout }}
         --runner_service_account=${{ inputs.runner_service_account }}
         --image_project=${{ inputs.image_project }}
         --image=${{ inputs.image }}

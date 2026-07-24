@@ -33,6 +33,7 @@ network=
 scopes=
 shutdown_timeout=
 finish_timeout=
+deletion_timeout=
 subnet=
 preemptible=
 ephemeral=
@@ -62,6 +63,7 @@ while getopts_long :h opt \
   scopes required_argument \
   shutdown_timeout required_argument \
   finish_timeout required_argument \
+  deletion_timeout required_argument \
   subnet optional_argument \
   preemptible required_argument \
   ephemeral required_argument \
@@ -124,6 +126,9 @@ do
       ;;
     finish_timeout)
       finish_timeout=$OPTLARG
+      ;;
+    deletion_timeout)
+      deletion_timeout=$OPTLARG
       ;;
     subnet)
       subnet=${OPTLARG-$subnet}
@@ -200,6 +205,18 @@ function start_vm {
   accelerator=$([[ ! -z "${accelerator}"  ]] && echo "--accelerator=${accelerator} --maintenance-policy=TERMINATE" || echo "")
   maintenance_policy_flag=$([[ -z "${maintenance_policy_terminate}"  ]] || echo "--maintenance-policy=TERMINATE" )
 
+  # Clamp deletion_timeout to real-world ceilings: GCE preemptible VMs are hard-terminated
+  # by Google after 24h regardless of anything else, and GitHub Actions workflow runs are
+  # capped at 3 days in all cases.
+  deletion_timeout_max=259200
+  if [[ "${preemptible}" == "true" ]]; then
+    deletion_timeout_max=86400
+  fi
+  if (( deletion_timeout > deletion_timeout_max )); then
+    echo "⚠️ deletion_timeout=${deletion_timeout}s exceeds the maximum allowed (${deletion_timeout_max}s). Clamping to ${deletion_timeout_max}s."
+    deletion_timeout=${deletion_timeout_max}
+  fi
+
   echo "The new GCE VM will be ${VM_ID}"
 
   startup_script="
@@ -244,8 +261,9 @@ function start_vm {
 	./svc.sh install && \\
 	./svc.sh start && \\
 	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=1
-	# 3 days represents the max workflow runtime. We're using 1 hour as nothing should run that long before an runner is deleted
-	nohup sh -c \"sleep 1h && gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}\" > /dev/null &
+	# Safety-net deletion in case the shutdown-hook mechanism above fails to tear down the VM.
+	# deletion_timeout is clamped to GCE's 24h preemptible limit and/or GitHub Actions' 3-day workflow limit.
+	nohup sh -c \"sleep ${deletion_timeout} && gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}\" > /dev/null &
   "
 
   if $actions_preinstalled ; then

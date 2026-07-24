@@ -25,6 +25,10 @@ on:
         description: "Shutdown grace period (in seconds) when manually stopped."
         default: 30
         required: true
+      deletion_timeout:
+        description: "Safety-net VM deletion timeout (in seconds)."
+        default: 3600
+        required: true
       no_external_address:
         description: Disables external IP address for the worker
         default: true
@@ -58,6 +62,7 @@ jobs:
           no_external_address: ${{ inputs.no_external_address }}
           actions_preinstalled: ${{ inputs.actions_preinstalled }}
           shutdown_timeout: ${{ inputs.shutdown_timeout }}
+          deletion_timeout: ${{ inputs.deletion_timeout }}
 
   test1:
     needs: create-runner

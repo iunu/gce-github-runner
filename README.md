@@ -33,6 +33,7 @@ jobs:
           no_external_address: true
           actions_preinstalled: false
           shutdown_timeout: 60 #max runtime
+          deletion_timeout: 3600 #safety-net deletion if shutdown-hook fails
 
   test:
     needs: create-runner

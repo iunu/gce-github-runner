@@ -8,7 +8,7 @@ branding:
   color: purple
 inputs:
   command:
-    description: "`start` or `stop` of the runner"
+    description: "`start`, `stop`, or `delete` (pool-mode cleanup) of the runner"
     default: start
     required: true
   token:
@@ -78,6 +78,19 @@ inputs:
     description: Set GitHub runner to be ephemeral; https://docs.github.com/en/actions/hosting-your-own-runners/autoscaling-with-self-hosted-runners#using-ephemeral-runners-for-autoscaling
     default: false
     required: true
+  reuse_key:
+    description: >-
+      Optional pool key. When set, enables pooled/reusable-runner mode: the VM is
+      deterministically named from this key plus repo context, stopped (not deleted)
+      when idle, and resumed (not recreated) on the next `start` call with the same
+      reuse_key -- skipping install/registration for a fast warm start, at the cost of
+      persisting disk state (build caches, etc.) between runs. Forces a non-ephemeral
+      runner regardless of the `ephemeral` input. Requires a companion `command: delete`
+      step (same reuse_key and machine_zone) wired to your own PR-closed/branch-deleted
+      trigger -- there is no automatic expiry. Leave unset (default) for today's
+      behavior: a unique ephemeral VM per run, deleted when done. See README.
+    default: ""
+    required: false
   no_external_address:
     description: Disables external IP address for the worker
     default: false
@@ -152,6 +165,7 @@ runs:
         --boot_disk_type=${{ inputs.boot_disk_type }}
         --preemptible=${{ inputs.preemptible }}
         --ephemeral=${{ inputs.ephemeral }}
+        --reuse_key='${{ inputs.reuse_key }}'
         --no_external_address=${{ inputs.no_external_address }}
         --actions_preinstalled=${{ inputs.actions_preinstalled }}
         --maintenance_policy_terminate=${{ inputs.maintenance_policy_terminate }}

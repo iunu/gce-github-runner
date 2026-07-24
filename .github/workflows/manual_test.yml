@@ -37,6 +37,10 @@ on:
         description: "Whether the GitHub actions have already been installed at `/actions-runner`."
         default: "false"
         required: true
+      reuse_key:
+        description: "Pool key for testing reusable-runner mode (leave empty for default one-shot behavior)."
+        required: false
+        default: ""
 
 jobs:
   create-runner:
@@ -63,6 +67,7 @@ jobs:
           actions_preinstalled: ${{ inputs.actions_preinstalled }}
           shutdown_timeout: ${{ inputs.shutdown_timeout }}
           deletion_timeout: ${{ inputs.deletion_timeout }}
+          reuse_key: ${{ inputs.reuse_key }}
 
   test1:
     needs: create-runner

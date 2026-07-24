@@ -118,6 +118,75 @@ The GCE runner image should have at least:
 
 * [Test Workflow](./.github/workflows/test.yml): Test workflow.
 
+## Pooled / reusable runners
+
+By default every workflow run gets its own throwaway VM, deleted when the job finishes. For a
+sequence of pushes to the same open PR, that means paying full VM boot + runner install +
+dependency install/compile cost every single time.
+
+Setting `reuse_key` opts into pooled mode instead: the VM is named deterministically from that
+key (plus repo context), **stopped** (not deleted) when idle, and **resumed** (not recreated) the
+next time a run with the same `reuse_key` needs a runner — skipping install/registration entirely,
+and, as a side effect, keeping anything left on disk (build/dependency caches) from the prior run.
+
+```yaml
+      - name: Create Runner
+        id: create-runner
+        uses: iunu/gce-github-runner@iunu
+        with:
+          token: ${{ secrets.GH_PAT_TOKEN }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          machine_zone: 'us-central1-c'
+          machine_type: 'c2-standard-4'
+          preemptible: true
+          reuse_key: pr-${{ github.event.pull_request.number }}
+```
+
+Nothing else about the calling job needs to change — the existing `command: stop` step (whichever
+pattern you use above) automatically **stops** rather than deletes a pooled VM, since that behavior
+is baked into the VM at creation time.
+
+Since a stopped pooled VM is never deleted on its own, you're responsible for reclaiming it. Wire a
+`command: delete` step to your own PR-closed (or branch-deleted) trigger, using the **same
+`reuse_key` and `machine_zone`** that were used to create it (instance names are zone-scoped, and
+`reuse_key` is an opaque string the action doesn't interpret, so it must match exactly):
+
+```yaml
+name: Runner Pool Cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  delete-pooled-runner:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: iunu/gce-github-runner@iunu
+        with:
+          command: delete
+          reuse_key: pr-${{ github.event.pull_request.number }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          machine_zone: 'us-central1-c'
+```
+
+This step is safe to run even if CI never executed on that PR — it's a no-op if the VM doesn't exist.
+
+**Limitations to be aware of:**
+
+* **Security**: pooled VMs are non-ephemeral by design, and disk state (including anything a prior
+  job left behind) persists across runs sharing a `reuse_key`. This raises the stakes of the
+  [public-repo warning below](#self-hosted-runner-security-with-public-repositories) considerably if
+  `reuse_key` can ever be influenced by an untrusted contributor (e.g. derived from a branch name
+  they choose). Recommended only for private repos or trusted-contributor-only workflows.
+* **Concurrency**: two overlapping runs sharing a `reuse_key` don't run in parallel — GitHub only
+  ever dispatches one job at a time to a given self-hosted runner, so the second run's job queues
+  until the first finishes. This is expected behavior, not a bug.
+* **No auto-expiry**: nothing deletes a pooled VM on its own; cleanup is entirely the caller's
+  responsibility via `command: delete`.
+
 ## Self-hosted runner security with public repositories
 
 From [GitHub's documentation](https://docs.github.com/en/actions/hosting-your-own-runners/about-self-hosted-runners#self-hosted-runner-security-with-public-repositories):

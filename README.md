@@ -114,6 +114,32 @@ The GCE runner image should have at least:
  * `git`
  * (optionally) GitHub Actions Runner (see `actions_preinstalled` parameter)
 
+## Zone fallback on capacity stockouts
+
+Preemptible/spot VMs can be rejected with a capacity error (`ZONE_RESOURCE_POOL_EXHAUSTED`) when
+a zone simply doesn't have machines to spare. Set `machine_zones` to a comma-separated list of
+additional zones to try, in order, if `machine_zone` (or an earlier fallback) hits this specific
+error:
+
+```yaml
+          machine_zone: 'us-central1-c'
+          machine_zones: 'us-central1-a,us-central1-f'
+```
+
+This only applies to creating a brand-new VM — it does not apply when resuming an existing pooled
+(`reuse_key`) VM, since a pooled VM's disk is pinned to whichever zone it was originally created
+in. Any other failure (bad image, quota exceeded, auth error, etc.) fails immediately without
+trying other zones.
+
+The VM may land in a different zone than the `machine_zone` input if fallback was used. The
+`zone` output always reflects the zone actually used:
+
+```yaml
+    outputs:
+      label: ${{ steps.create-runner.outputs.label }}
+      zone: ${{ steps.create-runner.outputs.zone }}
+```
+
 ## Example Workflows
 
 * [Test Workflow](./.github/workflows/test.yml): Test workflow.
@@ -173,6 +199,16 @@ jobs:
 ```
 
 This step is safe to run even if CI never executed on that PR — it's a no-op if the VM doesn't exist.
+It also deregisters the runner from GitHub (via the API, using `token`) if one is found, since a
+pooled runner is always non-ephemeral and would otherwise sit "Offline" in the GitHub Actions UI
+for up to 30 days after its VM is gone, until GitHub's own stale-runner cleanup catches up.
+
+If you also use `machine_zones` fallback (see above) together with `reuse_key`, the pooled VM may
+land in a fallback zone rather than your static `machine_zone` input. Capture the `zone` output
+from the `create` step and pass it as `machine_zone` to your `command: delete` step instead of the
+static value, or `delete` won't find it (zone-scoped names). Note resuming a pooled VM never gets
+zone fallback — its disk is pinned to whichever zone it was originally created in, so a stockout
+on resume simply fails rather than trying another zone.
 
 **Limitations to be aware of:**
 

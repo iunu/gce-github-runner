@@ -32,6 +32,15 @@ inputs:
     description: GCE zone
     default: "us-central1-c"
     required: true
+  machine_zones:
+    description: >-
+      Optional comma-separated list of additional zones to try, in order, if `machine_zone`
+      (or an earlier fallback) fails with a capacity stockout (preemptible/spot VMs can be
+      rejected with ZONE_RESOURCE_POOL_EXHAUSTED when a zone is out of capacity). Only applies
+      to fresh VM creation, not to resuming an existing pooled (`reuse_key`) VM. Leave unset
+      (default) to keep today's behavior: only `machine_zone` is tried.
+    default: ""
+    required: false
   machine_type:
     description: GCE machine type; https://cloud.google.com/compute/docs/machine-types
     default: "n1-standard-4"
@@ -137,6 +146,13 @@ outputs:
       Unique runner label. This label can be used to request a specific
       runner for the workflow job.
     value: ${{ steps.gce-github-runner-script.outputs.label }}
+  zone:
+    description: >-
+      The zone the VM actually landed in (may differ from the `machine_zone` input if
+      `machine_zones` fallback was used). Capture this and use it instead of the static
+      `machine_zone` input for any subsequent `command: delete` step when using `reuse_key`
+      together with `machine_zones`.
+    value: ${{ steps.gce-github-runner-script.outputs.zone }}
 runs:
   using: "composite"
   steps:
@@ -149,6 +165,7 @@ runs:
         --service_account_key='${{ inputs.service_account_key }}'
         --runner_ver=${{ inputs.runner_ver }}
         --machine_zone=${{ inputs.machine_zone }}
+        --machine_zones='${{ inputs.machine_zones }}'
         --machine_type=${{ inputs.machine_type }}
         --network=${{ inputs.network }}
         --subnet=${{ inputs.subnet }}

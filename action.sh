@@ -22,6 +22,7 @@ project_id=
 service_account_key=
 runner_ver=
 machine_zone=
+machine_zones=
 machine_type=
 boot_disk_type=
 disk_size=
@@ -53,6 +54,7 @@ while getopts_long :h opt \
   service_account_key required_argument \
   runner_ver required_argument \
   machine_zone required_argument \
+  machine_zones optional_argument \
   machine_type required_argument \
   boot_disk_type optional_argument \
   disk_size optional_argument \
@@ -95,6 +97,9 @@ do
       ;;
     machine_zone)
       machine_zone=$OPTLARG
+      ;;
+    machine_zones)
+      machine_zones=${OPTLARG-$machine_zones}
       ;;
     machine_type)
       machine_type=$OPTLARG
@@ -206,6 +211,100 @@ function compute_pool_vm_name {
   echo -n "${prefix}${sanitized}${suffix}"
 }
 
+# Builds the GCE startup-script metadata value (sets $startup_script as a side effect). Reads
+# VM_ID, machine_zone, vm_teardown_action, shutdown_timeout, deletion_timeout, GITHUB_REPOSITORY,
+# RUNNER_TOKEN, ephemeral_flag, actions_preinstalled, runner_ver, arm from the enclosing scope.
+# Safe to call more than once per start_vm invocation (e.g. once per zone-fallback attempt): the
+# "runner_ver=latest" resolution below mutates runner_ver to a concrete version on first call, so
+# the GitHub API lookup is automatically skipped on any later call.
+function build_startup_script {
+  startup_script="
+	# Create a systemd service in charge of shutting down the machine once the workflow has finished
+	cat <<-EOF > /etc/systemd/system/shutdown.sh
+	#!/bin/sh
+	sleep \${1}
+	gcloud compute instances ${vm_teardown_action} $VM_ID --zone=$machine_zone --quiet
+	EOF
+
+	cat <<-EOF > /etc/systemd/system/shutdown\@.service
+	[Unit]
+	Description=Shutdown service in %i Seconds
+	[Service]
+	ExecStart=/etc/systemd/system/shutdown.sh %i
+	[Install]
+	WantedBy=multi-user.target
+	EOF
+
+	chmod +x /etc/systemd/system/shutdown.sh
+	systemctl daemon-reload
+
+	cat <<-EOF > /usr/bin/gce_runner_shutdown.sh
+	#!/bin/sh
+	echo \"✅ Self deleting $VM_ID in ${machine_zone} in ${shutdown_timeout} seconds ...\"
+	# We tear down the machine by starting the systemd service that was registered by the startup script
+	systemctl start shutdown@${shutdown_timeout}.service
+	EOF
+
+	cat <<-EOF > /usr/bin/gce_cancel_shutdown.sh
+	#!/bin/sh
+	echo \"✅ Cancelling deletion of $VM_ID in ${machine_zone}!\"
+	# Stop the shutdown script
+	systemctl stop shutdown@${shutdown_timeout}.service
+	EOF
+
+	# See: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job
+	echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/bin/gce_runner_shutdown.sh" >.env
+  echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/bin/gce_cancel_shutdown.sh" >.env
+	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \\
+	if [ ! -f /actions-runner/.runner ]; then
+	  RUNNER_ALLOW_RUNASROOT=1 ./config.sh --url https://github.com/${GITHUB_REPOSITORY} --token ${RUNNER_TOKEN} --labels ${VM_ID} --unattended ${ephemeral_flag} --disableupdate && \\
+	  ./svc.sh install && \\
+	  ./svc.sh start
+	else
+	  echo \"✅ /actions-runner/.runner already present; skipping install/registration (resumed pooled VM). The runner service was already enabled on first boot and auto-starts on its own.\"
+	fi && \\
+	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=1
+	# Safety-net teardown in case the shutdown-hook mechanism above fails to tear down the VM.
+	# deletion_timeout is clamped to GCE's 24h preemptible limit and/or GitHub Actions' 3-day workflow limit.
+	nohup sh -c \"sleep ${deletion_timeout} && gcloud --quiet compute instances ${vm_teardown_action} ${VM_ID} --zone=${machine_zone}\" > /dev/null &
+  "
+
+  if $actions_preinstalled ; then
+    echo "✅ Startup script won't install GitHub Actions (pre-installed)"
+    startup_script="#!/bin/bash
+    cd /actions-runner
+    $startup_script"
+  else
+    if [[ "$runner_ver" = "latest" ]]; then
+      latest_ver=$(curl -sL https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed -e 's/^v//')
+      runner_ver="$latest_ver"
+      echo "✅ runner_ver=latest is specified. v$latest_ver is detected as the latest version."
+      if [[ -z "$latest_ver" || "null" == "$latest_ver" ]]; then
+        echo "❌ could not retrieve the latest version of a runner"
+        exit 2
+      fi
+    fi
+    echo "✅ Startup script will install GitHub Actions v$runner_ver"
+    if $arm ; then
+      startup_script="#!/bin/bash
+      mkdir -p /actions-runner
+      cd /actions-runner
+      curl -o actions-runner-linux-arm64-${runner_ver}.tar.gz -L https://github.com/actions/runner/releases/download/v${runner_ver}/actions-runner-linux-arm64-${runner_ver}.tar.gz
+      tar xzf ./actions-runner-linux-arm64-${runner_ver}.tar.gz
+      ./bin/installdependencies.sh && \\
+      $startup_script"
+    else
+      startup_script="#!/bin/bash
+      mkdir -p /actions-runner
+      cd /actions-runner
+      curl -o actions-runner-linux-x64-${runner_ver}.tar.gz -L https://github.com/actions/runner/releases/download/v${runner_ver}/actions-runner-linux-x64-${runner_ver}.tar.gz
+      tar xzf ./actions-runner-linux-x64-${runner_ver}.tar.gz
+      ./bin/installdependencies.sh && \\
+      $startup_script"
+    fi
+  fi
+}
+
 function start_vm {
   echo "Starting GCE VM ..."
   if [[ -z "${service_account_key}" ]] || [[ -z "${project_id}" ]]; then
@@ -287,149 +386,103 @@ function start_vm {
   fi
 
   if [[ "${pool_action}" == "create" || "${pool_action}" == "start" ]]; then
-    startup_script="
-	# Create a systemd service in charge of shutting down the machine once the workflow has finished
-	cat <<-EOF > /etc/systemd/system/shutdown.sh
-	#!/bin/sh
-	sleep \${1}
-	gcloud compute instances ${vm_teardown_action} $VM_ID --zone=$machine_zone --quiet
-	EOF
-
-	cat <<-EOF > /etc/systemd/system/shutdown\@.service
-	[Unit]
-	Description=Shutdown service in %i Seconds
-	[Service]
-	ExecStart=/etc/systemd/system/shutdown.sh %i
-	[Install]
-	WantedBy=multi-user.target
-	EOF
-
-	chmod +x /etc/systemd/system/shutdown.sh
-	systemctl daemon-reload
-
-	cat <<-EOF > /usr/bin/gce_runner_shutdown.sh
-	#!/bin/sh
-	echo \"✅ Self deleting $VM_ID in ${machine_zone} in ${shutdown_timeout} seconds ...\"
-	# We tear down the machine by starting the systemd service that was registered by the startup script
-	systemctl start shutdown@${shutdown_timeout}.service
-	EOF
-
-	cat <<-EOF > /usr/bin/gce_cancel_shutdown.sh
-	#!/bin/sh
-	echo \"✅ Cancelling deletion of $VM_ID in ${machine_zone}!\"
-	# Stop the shutdown script
-	systemctl stop shutdown@${shutdown_timeout}.service
-	EOF
-
-	# See: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job
-	echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/bin/gce_runner_shutdown.sh" >.env
-  echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/bin/gce_cancel_shutdown.sh" >.env
-	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \\
-	if [ ! -f /actions-runner/.runner ]; then
-	  RUNNER_ALLOW_RUNASROOT=1 ./config.sh --url https://github.com/${GITHUB_REPOSITORY} --token ${RUNNER_TOKEN} --labels ${VM_ID} --unattended ${ephemeral_flag} --disableupdate && \\
-	  ./svc.sh install && \\
-	  ./svc.sh start
-	else
-	  echo \"✅ /actions-runner/.runner already present; skipping install/registration (resumed pooled VM). The runner service was already enabled on first boot and auto-starts on its own.\"
-	fi && \\
-	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=1
-	# Safety-net teardown in case the shutdown-hook mechanism above fails to tear down the VM.
-	# deletion_timeout is clamped to GCE's 24h preemptible limit and/or GitHub Actions' 3-day workflow limit.
-	nohup sh -c \"sleep ${deletion_timeout} && gcloud --quiet compute instances ${vm_teardown_action} ${VM_ID} --zone=${machine_zone}\" > /dev/null &
-  "
-
-    if $actions_preinstalled ; then
-      echo "✅ Startup script won't install GitHub Actions (pre-installed)"
-      startup_script="#!/bin/bash
-      cd /actions-runner
-      $startup_script"
-    else
-      if [[ "$runner_ver" = "latest" ]]; then
-        latest_ver=$(curl -sL https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed -e 's/^v//')
-        runner_ver="$latest_ver"
-        echo "✅ runner_ver=latest is specified. v$latest_ver is detected as the latest version."
-        if [[ -z "$latest_ver" || "null" == "$latest_ver" ]]; then
-          echo "❌ could not retrieve the latest version of a runner"
-          exit 2
-        fi
-      fi
-      echo "✅ Startup script will install GitHub Actions v$runner_ver"
-      if $arm ; then
-        startup_script="#!/bin/bash
-        mkdir -p /actions-runner
-        cd /actions-runner
-        curl -o actions-runner-linux-arm64-${runner_ver}.tar.gz -L https://github.com/actions/runner/releases/download/v${runner_ver}/actions-runner-linux-arm64-${runner_ver}.tar.gz
-        tar xzf ./actions-runner-linux-arm64-${runner_ver}.tar.gz
-        ./bin/installdependencies.sh && \\
-        $startup_script"
-      else
-        startup_script="#!/bin/bash
-        mkdir -p /actions-runner
-        cd /actions-runner
-        curl -o actions-runner-linux-x64-${runner_ver}.tar.gz -L https://github.com/actions/runner/releases/download/v${runner_ver}/actions-runner-linux-x64-${runner_ver}.tar.gz
-        tar xzf ./actions-runner-linux-x64-${runner_ver}.tar.gz
-        ./bin/installdependencies.sh && \\
-        $startup_script"
-      fi
-    fi
-
-    # GCE VM label values requirements:
-    # - can contain only lowercase letters, numeric characters, underscores, and dashes
-    # - have a maximum length of 63 characters
-    # ref: https://cloud.google.com/compute/docs/labeling-resources#requirements
-    #
-    # Github's requirements:
-    # - username/organization name
-    #   - Max length: 39 characters
-    #   - All characters must be either a hyphen (-) or alphanumeric
-    # - repository name
-    #   - Max length: 100 code points
-    #   - All code points must be either a hyphen (-), an underscore (_), a period (.),
-    #     or an ASCII alphanumeric code point
-    # ref: https://github.com/dead-claudia/github-limits
-    function truncate_to_label {
-      local in="${1}"
-      in="${in:0:63}"                              # ensure max length
-      in="${in//./_}"                              # replace '.' with '_'
-      in=$(tr '[:upper:]' '[:lower:]' <<< "${in}") # convert to lower
-      echo -n "${in}"
-    }
-    gh_repo_owner="$(truncate_to_label "${GITHUB_REPOSITORY_OWNER}")"
-    gh_repo="$(truncate_to_label "${GITHUB_REPOSITORY##*/}")"
-    gh_run_id="${GITHUB_RUN_ID}"
-
     if [[ "${pool_action}" == "create" ]]; then
-      gcloud compute instances create ${VM_ID} \
-        --zone=${machine_zone} \
-        ${disk_size_flag} \
-        ${boot_disk_type_flag} \
-        --machine-type=${machine_type} \
-        --scopes=${scopes} \
-        ${service_account_flag} \
-        ${image_project_flag} \
-        ${image_flag} \
-        ${image_family_flag} \
-        ${preemptible_flag} \
-        ${no_external_address_flag} \
-        ${network_flag} \
-        ${subnet_flag} \
-        ${accelerator} \
-        ${maintenance_policy_flag} \
-        "${min_cpu_platform_flag}" \
-        --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}" \
-        --metadata=startup-script="$startup_script" \
-        && echo "label=${VM_ID}" >> $GITHUB_OUTPUT
+      # GCE VM label values requirements:
+      # - can contain only lowercase letters, numeric characters, underscores, and dashes
+      # - have a maximum length of 63 characters
+      # ref: https://cloud.google.com/compute/docs/labeling-resources#requirements
+      #
+      # Github's requirements:
+      # - username/organization name
+      #   - Max length: 39 characters
+      #   - All characters must be either a hyphen (-) or alphanumeric
+      # - repository name
+      #   - Max length: 100 code points
+      #   - All code points must be either a hyphen (-), an underscore (_), a period (.),
+      #     or an ASCII alphanumeric code point
+      # ref: https://github.com/dead-claudia/github-limits
+      function truncate_to_label {
+        local in="${1}"
+        in="${in:0:63}"                              # ensure max length
+        in="${in//./_}"                              # replace '.' with '_'
+        in=$(tr '[:upper:]' '[:lower:]' <<< "${in}") # convert to lower
+        echo -n "${in}"
+      }
+      gh_repo_owner="$(truncate_to_label "${GITHUB_REPOSITORY_OWNER}")"
+      gh_repo="$(truncate_to_label "${GITHUB_REPOSITORY##*/}")"
+      gh_run_id="${GITHUB_RUN_ID}"
+
+      # Zone fallback: try machine_zone first, then any machine_zones fallbacks in order, on a
+      # capacity stockout (ZONE_RESOURCE_POOL_EXHAUSTED). Non-stockout errors fail immediately.
+      zones_to_try=("${machine_zone}")
+      if [[ -n "${machine_zones}" ]]; then
+        IFS=',' read -ra fallback_zone_list <<< "${machine_zones}"
+        zones_to_try+=("${fallback_zone_list[@]}")
+      fi
+
+      create_succeeded="false"
+      for candidate_zone in "${zones_to_try[@]}"; do
+        machine_zone="${candidate_zone}"
+        build_startup_script
+
+        set +o errexit
+        create_output=$(gcloud compute instances create ${VM_ID} \
+          --zone=${machine_zone} \
+          ${disk_size_flag} \
+          ${boot_disk_type_flag} \
+          --machine-type=${machine_type} \
+          --scopes=${scopes} \
+          ${service_account_flag} \
+          ${image_project_flag} \
+          ${image_flag} \
+          ${image_family_flag} \
+          ${preemptible_flag} \
+          ${no_external_address_flag} \
+          ${network_flag} \
+          ${subnet_flag} \
+          ${accelerator} \
+          ${maintenance_policy_flag} \
+          "${min_cpu_platform_flag}" \
+          --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}" \
+          --metadata=startup-script="$startup_script" 2>&1)
+        create_rc=$?
+        set -o errexit
+
+        if [[ ${create_rc} -eq 0 ]]; then
+          echo "${create_output}"
+          create_succeeded="true"
+          break
+        elif grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${create_output}"; then
+          echo "⚠️ Zone ${candidate_zone} appears to be out of capacity (stockout); trying next zone if available." >&2
+          echo "${create_output}" >&2
+        else
+          echo "${create_output}" >&2
+          exit 1
+        fi
+      done
+
+      if [[ "${create_succeeded}" != "true" ]]; then
+        echo "❌ All candidate zones (${zones_to_try[*]}) are out of capacity." >&2
+        exit 1
+      fi
+      echo "label=${VM_ID}" >> $GITHUB_OUTPUT
+      echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
     else
-      # pool_action == start: resuming a stopped pooled VM. Reset gh_ready=0 first so the
-      # readiness poll below can't see a stale "1" left over from before this VM was stopped.
+      # pool_action == start: resuming a stopped pooled VM, single pinned machine_zone (no zone
+      # fallback -- its disk is fixed to whatever zone it was originally created in). Reset
+      # gh_ready=0 first so the readiness poll below can't see a stale "1" left over from before
+      # this VM was stopped.
+      build_startup_script
       gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \
       gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} --metadata=startup-script="$startup_script" && \
       gcloud compute instances start ${VM_ID} --zone=${machine_zone} \
       && echo "label=${VM_ID}" >> $GITHUB_OUTPUT
+      echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
     fi
   else
     # pool_action == reuse-running: VM is already up and gh_ready should already be 1.
     echo "label=${VM_ID}" >> $GITHUB_OUTPUT
+    echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
   fi
 
   safety_off
@@ -464,6 +517,44 @@ function stop_vm {
   systemctl start shutdown@${1}.service
 }
 
+# Finds and removes the GitHub Actions runner registration matching VM_ID's custom label
+# (the runner was registered with `config.sh --labels ${VM_ID}` at creation time; matching on
+# that label is robust regardless of the runner's hostname-derived name). Non-ephemeral runners
+# (pool mode always is) don't self-deregister on VM shutdown -- without this they just sit
+# "Offline" in the GitHub UI for up to 30 days until GitHub's own stale-runner cleanup.
+# Best-effort: run unconditionally, even if the GCE VM itself is already gone, so this also
+# cleans up an orphaned GitHub registration left over from a VM deleted some other way.
+function deregister_github_runner {
+  echo "Looking up GitHub runner registration for ${VM_ID} ..."
+  local page=1 runner_id="" runners_page runners_count
+
+  while [[ -z "${runner_id}" && ${page} -le 10 ]]; do
+    runners_page=$(curl -S -s -H "authorization: Bearer ${token}" \
+        "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners?per_page=100&page=${page}")
+    runner_id=$(jq -r --arg vm "${VM_ID}" '.runners[]? | select(.labels[]?.name == $vm) | .id' <<< "${runners_page}" | head -n1)
+    runners_count=$(jq -r '.runners | length' <<< "${runners_page}")
+    if [[ "${runners_count}" -lt 100 ]]; then
+      break
+    fi
+    page=$((page + 1))
+  done
+
+  if [[ -z "${runner_id}" || "${runner_id}" == "null" ]]; then
+    echo "ℹ️ No GitHub runner registration found for ${VM_ID} — nothing to deregister."
+    return
+  fi
+
+  echo "Deregistering GitHub runner ${VM_ID} (id ${runner_id}) ..."
+  http_code=$(curl -S -s -o /dev/null -w '%{http_code}' -X DELETE \
+      -H "authorization: Bearer ${token}" \
+      "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners/${runner_id}")
+  if [[ "${http_code}" == "204" ]]; then
+    echo "✅ Deregistered ${VM_ID} from GitHub."
+  else
+    echo "⚠️ Failed to deregister ${VM_ID} from GitHub (HTTP ${http_code})." >&2
+  fi
+}
+
 function delete_vm {
   # NOTE: this function runs off the GCE VM (e.g. from a PR-closed cleanup workflow)
   echo "Deleting pooled GCE VM ..."
@@ -481,6 +572,8 @@ function delete_vm {
 
   VM_ID="$(compute_pool_vm_name "${reuse_key}")"
   echo "Target pooled VM: ${VM_ID}"
+
+  deregister_github_runner
 
   set +o errexit
   gcloud compute instances describe "${VM_ID}" --zone=${machine_zone} &>/dev/null

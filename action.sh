@@ -329,19 +329,29 @@ function start_vm {
   pool_action="create"
   if [[ -n "${reuse_key}" ]]; then
     set +o errexit
-    existing_status="$(gcloud compute instances describe "${VM_ID}" --zone=${machine_zone} --format='value(status)' 2>/dev/null)"
+    describe_output=$(gcloud compute instances describe "${VM_ID}" --zone=${machine_zone} --format='value(status)' 2>&1)
     describe_rc=$?
     set -o errexit
 
-    if [[ ${describe_rc} -ne 0 ]]; then
+    if [[ ${describe_rc} -eq 0 ]]; then
+      existing_status="${describe_output}"
+      if [[ "${existing_status}" == "RUNNING" ]]; then
+        echo "✅ Pooled VM ${VM_ID} already RUNNING; reusing as-is."
+        pool_action="reuse-running"
+      else
+        echo "Pooled VM ${VM_ID} exists (state ${existing_status}); resuming (warm start)."
+        pool_action="start"
+      fi
+    elif grep -qi 'was not found' <<< "${describe_output}"; then
       echo "No existing pooled VM ${VM_ID} found; will create it."
       pool_action="create"
-    elif [[ "${existing_status}" == "RUNNING" ]]; then
-      echo "✅ Pooled VM ${VM_ID} already RUNNING; reusing as-is."
-      pool_action="reuse-running"
     else
-      echo "Pooled VM ${VM_ID} exists (state ${existing_status}); resuming (warm start)."
-      pool_action="start"
+      # Anything other than a genuine 404 (permissions, transient API error, etc.) must not be
+      # silently treated as "doesn't exist" -- that's exactly what leads to a confusing
+      # "already exists" failure later from `create`, against a VM that was there all along.
+      echo "❌ Could not determine whether pooled VM ${VM_ID} already exists:" >&2
+      echo "${describe_output}" >&2
+      exit 1
     fi
   fi
 
@@ -526,11 +536,22 @@ function stop_vm {
 # cleans up an orphaned GitHub registration left over from a VM deleted some other way.
 function deregister_github_runner {
   echo "Looking up GitHub runner registration for ${VM_ID} ..."
-  local page=1 runner_id="" runners_page runners_count
+  local page=1 runner_id="" runners_page runners_count http_status list_response
 
   while [[ -z "${runner_id}" && ${page} -le 10 ]]; do
-    runners_page=$(curl -S -s -H "authorization: Bearer ${token}" \
+    list_response=$(curl -S -s -w '\n%{http_code}' -H "authorization: Bearer ${token}" \
         "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners?per_page=100&page=${page}")
+    http_status="${list_response##*$'\n'}"
+    runners_page="${list_response%$'\n'*}"
+
+    if [[ "${http_status}" != "200" ]]; then
+      # Best-effort: don't let a failed/rate-limited GitHub API lookup silently masquerade as
+      # "no runner found" (which would skip real deregistration) or block the VM deletion below.
+      echo "⚠️ Could not list GitHub runners (HTTP ${http_status}); skipping GitHub deregistration for ${VM_ID}." >&2
+      echo "${runners_page}" >&2
+      return
+    fi
+
     runner_id=$(jq -r --arg vm "${VM_ID}" '.runners[]? | select(.labels[]?.name == $vm) | .id' <<< "${runners_page}" | head -n1)
     runners_count=$(jq -r '.runners | length' <<< "${runners_page}")
     if [[ "${runners_count}" -lt 100 ]]; then
@@ -576,13 +597,20 @@ function delete_vm {
   deregister_github_runner
 
   set +o errexit
-  gcloud compute instances describe "${VM_ID}" --zone=${machine_zone} &>/dev/null
+  describe_output=$(gcloud compute instances describe "${VM_ID}" --zone=${machine_zone} 2>&1)
   exists_rc=$?
   set -o errexit
 
   if [[ ${exists_rc} -ne 0 ]]; then
-    echo "ℹ️ ${VM_ID} does not exist (already deleted, or CI never ran on this reuse_key) — nothing to do."
-    return
+    if grep -qi 'was not found' <<< "${describe_output}"; then
+      echo "ℹ️ ${VM_ID} does not exist (already deleted, or CI never ran on this reuse_key) — nothing to do."
+      return
+    fi
+    # Anything other than a genuine 404 must not be silently treated as "already gone" -- that
+    # would leave a real VM (and its cost) behind with no indication cleanup actually failed.
+    echo "❌ Could not determine whether ${VM_ID} exists:" >&2
+    echo "${describe_output}" >&2
+    exit 1
   fi
 
   gcloud --quiet compute instances delete "${VM_ID}" --zone=${machine_zone}

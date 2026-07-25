@@ -192,6 +192,7 @@ jobs:
       - uses: iunu/gce-github-runner@iunu
         with:
           command: delete
+          token: ${{ secrets.GH_PAT_TOKEN }}
           reuse_key: pr-${{ github.event.pull_request.number }}
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           service_account_key: ${{ secrets.GCP_SA_KEY }}

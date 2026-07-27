@@ -218,6 +218,34 @@ function compute_pool_vm_name {
 # "runner_ver=latest" resolution below mutates runner_ver to a concrete version on first call, so
 # the GitHub API lookup is automatically skipped on any later call.
 function build_startup_script {
+  # Steps needed to fetch/extract the runner binary on a genuinely fresh VM -- gated below behind
+  # the same /actions-runner/.runner existence check as config.sh, so a resumed pooled VM skips
+  # this entirely instead of redundantly re-downloading and re-extracting on every resume.
+  runner_download_cmds=""
+  if ! $actions_preinstalled ; then
+    if [[ "$runner_ver" = "latest" ]]; then
+      latest_ver=$(curl -sL https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed -e 's/^v//')
+      runner_ver="$latest_ver"
+      echo "✅ runner_ver=latest is specified. v$latest_ver is detected as the latest version."
+      if [[ -z "$latest_ver" || "null" == "$latest_ver" ]]; then
+        echo "❌ could not retrieve the latest version of a runner"
+        exit 2
+      fi
+    fi
+    echo "✅ Startup script will install GitHub Actions v$runner_ver"
+    if $arm ; then
+      runner_download_cmds="curl -o actions-runner-linux-arm64-${runner_ver}.tar.gz -L https://github.com/actions/runner/releases/download/v${runner_ver}/actions-runner-linux-arm64-${runner_ver}.tar.gz && \\
+	  tar xzf ./actions-runner-linux-arm64-${runner_ver}.tar.gz && \\
+	  ./bin/installdependencies.sh && \\
+	  "
+    else
+      runner_download_cmds="curl -o actions-runner-linux-x64-${runner_ver}.tar.gz -L https://github.com/actions/runner/releases/download/v${runner_ver}/actions-runner-linux-x64-${runner_ver}.tar.gz && \\
+	  tar xzf ./actions-runner-linux-x64-${runner_ver}.tar.gz && \\
+	  ./bin/installdependencies.sh && \\
+	  "
+    fi
+  fi
+
   startup_script="
 	# Create a systemd service in charge of shutting down the machine once the workflow has finished
 	cat <<-EOF > /etc/systemd/system/shutdown.sh
@@ -257,12 +285,12 @@ function build_startup_script {
   echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/bin/gce_cancel_shutdown.sh" >.env
 	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \\
 	if [ ! -f /actions-runner/.runner ]; then
-	  RUNNER_ALLOW_RUNASROOT=1 ./config.sh --url https://github.com/${GITHUB_REPOSITORY} --token ${RUNNER_TOKEN} --labels ${VM_ID} --unattended ${ephemeral_flag} --disableupdate && \\
-	  ./svc.sh install && \\
-	  ./svc.sh start
+	  ${runner_download_cmds}RUNNER_ALLOW_RUNASROOT=1 ./config.sh --url https://github.com/${GITHUB_REPOSITORY} --token ${RUNNER_TOKEN} --labels ${VM_ID} --unattended ${ephemeral_flag} --disableupdate && \\
+	  ./svc.sh install
 	else
-	  echo \"✅ /actions-runner/.runner already present; skipping install/registration (resumed pooled VM). The runner service was already enabled on first boot and auto-starts on its own.\"
+	  echo \"✅ /actions-runner/.runner already present; skipping download/install/registration (resumed pooled VM).\"
 	fi && \\
+	./svc.sh start && \\
 	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=1
 	# Safety-net teardown in case the shutdown-hook mechanism above fails to tear down the VM.
 	# deletion_timeout is clamped to GCE's 24h preemptible limit and/or GitHub Actions' 3-day workflow limit.
@@ -275,33 +303,10 @@ function build_startup_script {
     cd /actions-runner
     $startup_script"
   else
-    if [[ "$runner_ver" = "latest" ]]; then
-      latest_ver=$(curl -sL https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed -e 's/^v//')
-      runner_ver="$latest_ver"
-      echo "✅ runner_ver=latest is specified. v$latest_ver is detected as the latest version."
-      if [[ -z "$latest_ver" || "null" == "$latest_ver" ]]; then
-        echo "❌ could not retrieve the latest version of a runner"
-        exit 2
-      fi
-    fi
-    echo "✅ Startup script will install GitHub Actions v$runner_ver"
-    if $arm ; then
-      startup_script="#!/bin/bash
-      mkdir -p /actions-runner
-      cd /actions-runner
-      curl -o actions-runner-linux-arm64-${runner_ver}.tar.gz -L https://github.com/actions/runner/releases/download/v${runner_ver}/actions-runner-linux-arm64-${runner_ver}.tar.gz
-      tar xzf ./actions-runner-linux-arm64-${runner_ver}.tar.gz
-      ./bin/installdependencies.sh && \\
-      $startup_script"
-    else
-      startup_script="#!/bin/bash
-      mkdir -p /actions-runner
-      cd /actions-runner
-      curl -o actions-runner-linux-x64-${runner_ver}.tar.gz -L https://github.com/actions/runner/releases/download/v${runner_ver}/actions-runner-linux-x64-${runner_ver}.tar.gz
-      tar xzf ./actions-runner-linux-x64-${runner_ver}.tar.gz
-      ./bin/installdependencies.sh && \\
-      $startup_script"
-    fi
+    startup_script="#!/bin/bash
+    mkdir -p /actions-runner
+    cd /actions-runner
+    $startup_script"
   fi
 }
 
@@ -355,7 +360,11 @@ function start_vm {
     fi
   fi
 
-  if [[ "${pool_action}" == "create" ]]; then
+  if [[ "${pool_action}" == "create" || "${pool_action}" == "start" ]]; then
+    # build_startup_script always interpolates ${RUNNER_TOKEN} while constructing the script text
+    # (even though the resulting `config.sh --token ${RUNNER_TOKEN}` line only actually executes
+    # on the VM if /actions-runner/.runner is missing) -- so it must be a valid, non-crashing
+    # value under `nounset` on both the "create" and "start" (resume) paths, not just "create".
     RUNNER_TOKEN=$(curl -S -s -XPOST \
         -H "authorization: Bearer ${token}" \
         https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners/registration-token |\
@@ -496,18 +505,31 @@ function start_vm {
   fi
 
   safety_off
+  runner_online="false"
   while (( i++ < 60 )); do
     GH_READY=$(gcloud compute instances describe ${VM_ID} --zone=${machine_zone} --format='json(labels)' | jq -r .labels.gh_ready)
     if [[ $GH_READY == 1 ]]; then
-      break
+      # The VM-side script finishing (gh_ready=1) only proves our shell commands ran -- it says
+      # nothing about whether the runner process actually connected. Confirm with GitHub itself
+      # before declaring success, so a runner stuck with stale/invalid local credentials (e.g. a
+      # resumed pooled VM whose registration was removed on GitHub's side while it sat stopped)
+      # gets caught here instead of silently sitting there never receiving jobs.
+      lookup="$(find_github_runner)"
+      gh_status="${lookup#* }"
+      if [[ "${gh_status}" == "online" ]]; then
+        runner_online="true"
+        break
+      fi
+      echo "${VM_ID} booted (gh_ready=1) but GitHub reports it as '${gh_status:-not found yet}'; waiting 5 secs ..."
+    else
+      echo "${VM_ID} not ready yet, waiting 5 secs ..."
     fi
-    echo "${VM_ID} not ready yet, waiting 5 secs ..."
     sleep 5
   done
-  if [[ $GH_READY == 1 ]]; then
-    echo "✅ ${VM_ID} ready ..."
+  if [[ "${runner_online}" == "true" ]]; then
+    echo "✅ ${VM_ID} ready and online on GitHub ..."
   else
-    echo "Waited 5 minutes for ${VM_ID}, without luck, deleting ${VM_ID} ..."
+    echo "Waited 5 minutes for ${VM_ID} to come online, without luck, deleting ${VM_ID} ..."
     gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}
     exit 1
   fi
@@ -527,32 +549,27 @@ function stop_vm {
   systemctl start shutdown@${1}.service
 }
 
-# Finds and removes the GitHub Actions runner registration matching VM_ID's custom label
-# (the runner was registered with `config.sh --labels ${VM_ID}` at creation time; matching on
-# that label is robust regardless of the runner's hostname-derived name). Non-ephemeral runners
-# (pool mode always is) don't self-deregister on VM shutdown -- without this they just sit
-# "Offline" in the GitHub UI for up to 30 days until GitHub's own stale-runner cleanup.
-# Best-effort: run unconditionally, even if the GCE VM itself is already gone, so this also
-# cleans up an orphaned GitHub registration left over from a VM deleted some other way.
-function deregister_github_runner {
-  echo "Looking up GitHub runner registration for ${VM_ID} ..."
-  local page=1 runner_id="" runners_page runners_count http_status list_response
+# Finds the GitHub Actions runner registered with VM_ID's custom label (set via
+# `config.sh --labels ${VM_ID}` at registration time; matching on that label is robust regardless
+# of the runner's hostname-derived name). Echoes "<id> <status>" on success (status is "online" or
+# "offline"); echoes nothing if not found, or if the API call itself failed (a warning is printed
+# to stderr in that case -- callers must treat empty output as "unknown", not "confirmed absent").
+function find_github_runner {
+  local page=1 result="" runners_page runners_count http_status list_response
 
-  while [[ -z "${runner_id}" && ${page} -le 10 ]]; do
+  while [[ -z "${result}" && ${page} -le 10 ]]; do
     list_response=$(curl -S -s -w '\n%{http_code}' -H "authorization: Bearer ${token}" \
         "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners?per_page=100&page=${page}")
     http_status="${list_response##*$'\n'}"
     runners_page="${list_response%$'\n'*}"
 
     if [[ "${http_status}" != "200" ]]; then
-      # Best-effort: don't let a failed/rate-limited GitHub API lookup silently masquerade as
-      # "no runner found" (which would skip real deregistration) or block the VM deletion below.
-      echo "⚠️ Could not list GitHub runners (HTTP ${http_status}); skipping GitHub deregistration for ${VM_ID}." >&2
+      echo "⚠️ Could not list GitHub runners (HTTP ${http_status})." >&2
       echo "${runners_page}" >&2
       return
     fi
 
-    runner_id=$(jq -r --arg vm "${VM_ID}" '.runners[]? | select(.labels[]?.name == $vm) | .id' <<< "${runners_page}" | head -n1)
+    result=$(jq -r --arg vm "${VM_ID}" '.runners[]? | select(.labels[]?.name == $vm) | "\(.id) \(.status)"' <<< "${runners_page}" | head -n1)
     runners_count=$(jq -r '.runners | length' <<< "${runners_page}")
     if [[ "${runners_count}" -lt 100 ]]; then
       break
@@ -560,7 +577,21 @@ function deregister_github_runner {
     page=$((page + 1))
   done
 
-  if [[ -z "${runner_id}" || "${runner_id}" == "null" ]]; then
+  echo "${result}"
+}
+
+# Non-ephemeral runners (pool mode always is) don't self-deregister on VM shutdown -- without
+# this they just sit "Offline" in the GitHub UI for up to 30 days until GitHub's own stale-runner
+# cleanup. Best-effort: run unconditionally, even if the GCE VM itself is already gone, so this
+# also cleans up an orphaned GitHub registration left over from a VM deleted some other way.
+function deregister_github_runner {
+  echo "Looking up GitHub runner registration for ${VM_ID} ..."
+  local lookup runner_id
+
+  lookup="$(find_github_runner)"
+  runner_id="${lookup%% *}"
+
+  if [[ -z "${runner_id}" ]]; then
     echo "ℹ️ No GitHub runner registration found for ${VM_ID} — nothing to deregister."
     return
   fi

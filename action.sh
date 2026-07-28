@@ -258,7 +258,14 @@ function build_startup_script {
 	cat <<-EOF > /etc/systemd/system/shutdown.sh
 	#!/bin/sh
 	sleep \${1}
-	gcloud compute instances ${vm_teardown_action} $VM_ID --zone=$machine_zone --quiet
+	# A job step that ran on this VM may have called gcloud auth activate-service-account for
+	# its own purposes (e.g. deploying/publishing something) which persists as gcloud's active
+	# identity for the rest of the VM's life. Explicitly force this VM's own attached service
+	# account here rather than silently inheriting whatever identity is currently active --
+	# otherwise this call can fail with a permission error from an unrelated SA or worse
+	# succeed using the wrong identity's permissions.
+	machine_sa=\$(curl -S -s -X GET http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email -H 'Metadata-Flavor: Google')
+	gcloud --account=\${machine_sa} compute instances ${vm_teardown_action} $VM_ID --zone=$machine_zone --quiet
 	EOF
 
 	cat <<-EOF > /etc/systemd/system/shutdown\@.service
@@ -306,7 +313,10 @@ function build_startup_script {
 	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=1
 	# Safety-net teardown in case the shutdown-hook mechanism above fails to tear down the VM.
 	# deletion_timeout is clamped to GCE's 24h preemptible limit and/or GitHub Actions' 3-day workflow limit.
-	nohup sh -c \"sleep ${deletion_timeout} && gcloud --quiet compute instances ${vm_teardown_action} ${VM_ID} --zone=${machine_zone}\" > /dev/null &
+	# Delegates to shutdown.sh (already written and chmod +x'd above) rather than duplicating its
+	# gcloud call here, so there is exactly one place that knows how to tear this VM down --
+	# including forcing the correct service account, see shutdown.sh's own comment.
+	nohup sh -c \"sleep ${deletion_timeout} && /etc/systemd/system/shutdown.sh 0\" > /dev/null &
   "
 
   # GCE shutdown-script: a metadata key distinct from startup-script, invoked by the guest agent
@@ -319,9 +329,11 @@ function build_startup_script {
   # ephemeral run (neither can ever be reused regardless of VM state, see start_vm). Deliberately
   # NEVER set when vm_teardown_action=="stop" (a pooled, non-ephemeral VM): those are meant to
   # persist across any stop, preemption included, so they must never carry a self-delete script.
+  # Delegates to shutdown.sh (see its own comment) rather than calling gcloud directly here too,
+  # so the service-account fix above only has to exist in one place.
   if [[ "${vm_teardown_action}" == "delete" ]]; then
     shutdown_script="#!/bin/sh
-gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}
+/etc/systemd/system/shutdown.sh 0
 "
   else
     shutdown_script=""

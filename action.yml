@@ -73,7 +73,12 @@ inputs:
         Number of accelerators to attach to each instance. The default value is 1.
     required: false
   runner_service_account:
-    description: Service account of the VM, defaults to default compute service account.
+    description: >-
+      Service account of the VM, defaults to default compute service account. This account
+      must have compute.instances.delete and compute.instances.stop permission on itself -- the
+      VM's self-teardown logic (job-completion hook, safety-net reaper, and the shutdown-script
+      that handles preemption) explicitly runs as this account, overriding any other identity a
+      job step running on the VM may have separately authenticated as in the meantime.
     required: false
   image_project:
     description: >

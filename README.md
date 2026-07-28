@@ -244,9 +244,13 @@ existing pooled VM to resume) and `delete` search every zone in `machine_zone` +
 `machine_zones` values** to every `start` and `delete` call for a given `reuse_key`, and the VM
 will be found regardless of which zone it actually landed in. If you don't — e.g. a `delete` step
 that omits `machine_zones` — the search may miss it, leaving an orphaned VM running, or (worse, on
-`start`) conclude none exists and create a duplicate with the same name in another zone. Note
-resuming a pooled VM never gets zone fallback on a stockout — its disk is pinned to whichever zone
-it was originally created in.
+`start`) conclude none exists and create a duplicate with the same name in another zone.
+
+If the pooled VM's own zone is stocked out when trying to resume it, `start` deletes the stale
+VM/disk there and creates a fresh one, retrying across `machine_zone` + `machine_zones` the same
+way a first-time create does — a stopped VM's disk can't be moved to another zone in place, so
+this trades away that run's warm start (no cached build/dependency state) in exchange for the
+runner coming up at all instead of the whole workflow failing.
 
 **Limitations to be aware of:**
 
@@ -286,10 +290,12 @@ error:
           machine_zones: 'us-central1-a,us-central1-f'
 ```
 
-This only applies to creating a brand-new VM — it does not apply when resuming an existing pooled
-(`reuse_key`) VM, since a pooled VM's disk is pinned to whichever zone it was originally created
-in. Any other failure (bad image, quota exceeded, auth error, etc.) fails immediately without
-trying other zones.
+This applies to creating a brand-new VM. It also applies when resuming an existing pooled
+(`reuse_key`) VM *if* that resume itself hits a stockout: since a pooled VM's disk is pinned to
+whichever zone it was originally created in and can't be moved in place, resuming can't retry the
+existing disk in another zone — instead, the stale VM/disk is deleted and a fresh one is created
+via the same fallback list, losing that run's warm-start state but still coming up. Any other
+failure (bad image, quota exceeded, auth error, etc.) fails immediately without trying other zones.
 
 The VM may land in a different zone than the `machine_zone` input if fallback was used. The
 `zone` output always reflects the zone actually used:

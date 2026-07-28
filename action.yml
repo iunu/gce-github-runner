@@ -41,8 +41,10 @@ inputs:
       existing pooled VM, since GCE instance names are unique per-zone, not per-project -- a
       pooled VM created via fallback may be sitting in any of them. Pass the same value
       consistently across `start` and `delete` calls for a given `reuse_key` so it can always be
-      found. Resuming an existing pooled VM never itself gets zone *fallback* on a stockout (its
-      disk is pinned to whichever zone it's already in). Leave unset (default) to keep today's
+      found. If resuming an existing pooled VM hits a stockout in its own zone (its disk is
+      pinned there, so it can't just be started elsewhere), the VM/disk is deleted and a fresh
+      one is created instead, falling back across these same zones -- warm-start state is lost
+      for that run, but the runner still comes up. Leave unset (default) to keep today's
       behavior: only `machine_zone` is tried.
     default: ""
     required: false

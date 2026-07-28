@@ -422,95 +422,122 @@ function start_vm {
     echo "Reusing pooled GCE VM ${VM_ID} (${pool_action})"
   fi
 
-  if [[ "${pool_action}" == "create" || "${pool_action}" == "start" ]]; then
-    if [[ "${pool_action}" == "create" ]]; then
-      # GCE VM label values requirements:
-      # - can contain only lowercase letters, numeric characters, underscores, and dashes
-      # - have a maximum length of 63 characters
-      # ref: https://cloud.google.com/compute/docs/labeling-resources#requirements
-      #
-      # Github's requirements:
-      # - username/organization name
-      #   - Max length: 39 characters
-      #   - All characters must be either a hyphen (-) or alphanumeric
-      # - repository name
-      #   - Max length: 100 code points
-      #   - All code points must be either a hyphen (-), an underscore (_), a period (.),
-      #     or an ASCII alphanumeric code point
-      # ref: https://github.com/dead-claudia/github-limits
-      function truncate_to_label {
-        local in="${1}"
-        in="${in:0:63}"                              # ensure max length
-        in="${in//./_}"                              # replace '.' with '_'
-        in=$(tr '[:upper:]' '[:lower:]' <<< "${in}") # convert to lower
-        echo -n "${in}"
-      }
-      gh_repo_owner="$(truncate_to_label "${GITHUB_REPOSITORY_OWNER}")"
-      gh_repo="$(truncate_to_label "${GITHUB_REPOSITORY##*/}")"
-      gh_run_id="${GITHUB_RUN_ID}"
+  # GCE VM label values requirements:
+  # - can contain only lowercase letters, numeric characters, underscores, and dashes
+  # - have a maximum length of 63 characters
+  # ref: https://cloud.google.com/compute/docs/labeling-resources#requirements
+  #
+  # Github's requirements:
+  # - username/organization name
+  #   - Max length: 39 characters
+  #   - All characters must be either a hyphen (-) or alphanumeric
+  # - repository name
+  #   - Max length: 100 code points
+  #   - All code points must be either a hyphen (-), an underscore (_), a period (.),
+  #     or an ASCII alphanumeric code point
+  # ref: https://github.com/dead-claudia/github-limits
+  function truncate_to_label {
+    local in="${1}"
+    in="${in:0:63}"                              # ensure max length
+    in="${in//./_}"                              # replace '.' with '_'
+    in=$(tr '[:upper:]' '[:lower:]' <<< "${in}") # convert to lower
+    echo -n "${in}"
+  }
 
-      # Zone fallback: try machine_zone first, then any machine_zones fallbacks in order, on a
-      # capacity stockout (ZONE_RESOURCE_POOL_EXHAUSTED). Non-stockout errors fail immediately.
-      # (zones_to_try was already built above, shared with the pooled-VM lookup.)
-      create_succeeded="false"
-      for candidate_zone in "${zones_to_try[@]}"; do
-        machine_zone="${candidate_zone}"
-        build_startup_script
+  # Creates a brand-new VM, trying each zone in $zones_to_try in order on a capacity stockout
+  # (ZONE_RESOURCE_POOL_EXHAUSTED). Non-stockout errors fail immediately, no further zones tried.
+  # Sets $machine_zone as a side effect to whichever zone actually succeeded. Called both for a
+  # genuine first-time create, and as a fallback when resuming an existing pooled VM turns out to
+  # be impossible because its home zone is itself stocked out (see pool_action == "start" below).
+  function create_fresh_vm {
+    local gh_repo_owner gh_repo gh_run_id candidate_zone create_output create_rc
+    gh_repo_owner="$(truncate_to_label "${GITHUB_REPOSITORY_OWNER}")"
+    gh_repo="$(truncate_to_label "${GITHUB_REPOSITORY##*/}")"
+    gh_run_id="${GITHUB_RUN_ID}"
 
-        set +o errexit
-        create_output=$(gcloud compute instances create ${VM_ID} \
-          --zone=${machine_zone} \
-          ${disk_size_flag} \
-          ${boot_disk_type_flag} \
-          --machine-type=${machine_type} \
-          --scopes=${scopes} \
-          ${service_account_flag} \
-          ${image_project_flag} \
-          ${image_flag} \
-          ${image_family_flag} \
-          ${preemptible_flag} \
-          ${no_external_address_flag} \
-          ${network_flag} \
-          ${subnet_flag} \
-          ${accelerator} \
-          ${maintenance_policy_flag} \
-          "${min_cpu_platform_flag}" \
-          --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}" \
-          --metadata=startup-script="$startup_script" 2>&1)
-        create_rc=$?
-        set -o errexit
+    create_succeeded="false"
+    for candidate_zone in "${zones_to_try[@]}"; do
+      machine_zone="${candidate_zone}"
+      build_startup_script
 
-        if [[ ${create_rc} -eq 0 ]]; then
-          echo "${create_output}"
-          create_succeeded="true"
-          break
-        elif grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${create_output}"; then
-          echo "⚠️ Zone ${candidate_zone} appears to be out of capacity (stockout); trying next zone if available." >&2
-          echo "${create_output}" >&2
-        else
-          echo "${create_output}" >&2
-          exit 1
-        fi
-      done
+      set +o errexit
+      create_output=$(gcloud compute instances create ${VM_ID} \
+        --zone=${machine_zone} \
+        ${disk_size_flag} \
+        ${boot_disk_type_flag} \
+        --machine-type=${machine_type} \
+        --scopes=${scopes} \
+        ${service_account_flag} \
+        ${image_project_flag} \
+        ${image_flag} \
+        ${image_family_flag} \
+        ${preemptible_flag} \
+        ${no_external_address_flag} \
+        ${network_flag} \
+        ${subnet_flag} \
+        ${accelerator} \
+        ${maintenance_policy_flag} \
+        "${min_cpu_platform_flag}" \
+        --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}" \
+        --metadata=startup-script="$startup_script" 2>&1)
+      create_rc=$?
+      set -o errexit
 
-      if [[ "${create_succeeded}" != "true" ]]; then
-        echo "❌ All candidate zones (${zones_to_try[*]}) are out of capacity." >&2
+      if [[ ${create_rc} -eq 0 ]]; then
+        echo "${create_output}"
+        create_succeeded="true"
+        break
+      elif grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${create_output}"; then
+        echo "⚠️ Zone ${candidate_zone} appears to be out of capacity (stockout); trying next zone if available." >&2
+        echo "${create_output}" >&2
+      else
+        echo "${create_output}" >&2
         exit 1
       fi
-      echo "label=${VM_ID}" >> $GITHUB_OUTPUT
-      echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
-    else
-      # pool_action == start: resuming a stopped pooled VM, single pinned machine_zone (no zone
-      # fallback -- its disk is fixed to whatever zone it was originally created in). Reset
-      # gh_ready=0 first so the readiness poll below can't see a stale "1" left over from before
-      # this VM was stopped.
-      build_startup_script
-      gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \
-      gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} --metadata=startup-script="$startup_script" && \
-      gcloud compute instances start ${VM_ID} --zone=${machine_zone} \
-      && echo "label=${VM_ID}" >> $GITHUB_OUTPUT
-      echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
+    done
+
+    if [[ "${create_succeeded}" != "true" ]]; then
+      echo "❌ All candidate zones (${zones_to_try[*]}) are out of capacity." >&2
+      exit 1
     fi
+  }
+
+  if [[ "${pool_action}" == "create" || "${pool_action}" == "start" ]]; then
+    if [[ "${pool_action}" == "create" ]]; then
+      create_fresh_vm
+    else
+      # pool_action == start: resuming a stopped pooled VM in the zone its disk already lives in
+      # (no zone fallback for a normal resume -- the disk is fixed to that zone). Reset gh_ready=0
+      # first so the readiness poll below can't see a stale "1" left over from before this VM was
+      # stopped.
+      build_startup_script
+
+      set +o errexit
+      start_output=$( (gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \
+        gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} --metadata=startup-script="$startup_script" && \
+        gcloud compute instances start ${VM_ID} --zone=${machine_zone}) 2>&1)
+      start_rc=$?
+      set -o errexit
+
+      if [[ ${start_rc} -eq 0 ]]; then
+        echo "${start_output}"
+      elif grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${start_output}"; then
+        # The stopped VM's own zone is stocked out -- it can't be resumed there, and moving a
+        # disk across zones isn't a thing GCE supports in-place. Fall back to the same
+        # zone-fallback create used for a brand-new VM, sacrificing this run's warm start (the
+        # old VM/disk is deleted) in exchange for not just failing outright.
+        echo "⚠️ Zone ${machine_zone} is out of capacity to resume pooled VM ${VM_ID} (stockout); deleting it there and creating fresh in a fallback zone (pool warm-start lost for this run)." >&2
+        echo "${start_output}" >&2
+        gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}
+        pool_action="create"
+        create_fresh_vm
+      else
+        echo "${start_output}" >&2
+        exit 1
+      fi
+    fi
+    echo "label=${VM_ID}" >> $GITHUB_OUTPUT
+    echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
   else
     # pool_action == reuse-running: VM is already up and gh_ready should already be 1.
     echo "label=${VM_ID}" >> $GITHUB_OUTPUT

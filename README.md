@@ -3,9 +3,23 @@
 [![Pre-commit](https://github.com/related-sciences/gce-github-runner/actions/workflows/pre_commit.yml/badge.svg?branch=main)](https://github.com/related-sciences/gce-github-runner/actions/workflows/pre_commit.yml)
 [![Test](https://github.com/related-sciences/gce-github-runner/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/related-sciences/gce-github-runner/actions/workflows/test.yml)
 
-Ephemeral GCE GitHub self-hosted runner.
+GCE GitHub self-hosted runner, ephemeral by default with an optional pooled/reusable mode.
 
-## Usage
+## How it works
+
+This action has three commands, used in different jobs of your workflow(s):
+
+| `command` | What it does | Runs on | Typical trigger |
+|---|---|---|---|
+| `start` (default) | Creates (or, in pool mode, resumes) a GCE VM and registers it as a GitHub Actions runner | A GitHub-hosted runner (e.g. `ubuntu-latest`) | The workflow that needs the runner |
+| `stop` | Schedules the VM to shut itself down (and, unless pooled, delete itself) after a grace period | **The GCE runner itself** (`runs-on: <label>`) | End of the same job, or a cleanup job/workflow |
+| `delete` | Deletes a pooled VM and deregisters it from GitHub | A GitHub-hosted runner | A separate cleanup trigger (PR closed, branch deleted, etc.) |
+
+The VM also shuts itself down automatically via a [runner hook](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job) once a job finishes, and `deletion_timeout` is a safety-net that tears it down even if that hook never fires. An explicit `stop` step is only needed for workflows with more than one job on the same runner (see below).
+
+## Quick start: one job, ephemeral runner
+
+The simplest case — a single job runs on the VM, then the shutdown hook cleans it up automatically. No `stop`/`delete` step needed at all.
 
 ```yaml
 jobs:
@@ -23,7 +37,6 @@ jobs:
           service_account_key: ${{ secrets.GCP_SA_KEY }}
           machine_zone: 'us-central1-c'
           machine_type: 'c2-standard-4'
-          runner_service_account: ${{ inputs.runner_service_account }}
           runner_ver: latest
           network: 'runner-net'
           subnet: 'runner-subnet'
@@ -32,29 +45,66 @@ jobs:
           preemptible: true
           no_external_address: true
           actions_preinstalled: false
-          shutdown_timeout: 60 #max runtime
-          deletion_timeout: 3600 #safety-net deletion if shutdown-hook fails
+          shutdown_timeout: 60   # grace period given to the runner hook after a job finishes
+          deletion_timeout: 3600 # safety-net deletion if the shutdown hook never fires
 
   test:
     needs: create-runner
     runs-on: ${{ needs.create-runner.outputs.label }}
     steps:
       - run: echo "This runs on the GCE VM"
-# Runners don't reliably cleanup due to GHA bugs, so we delete when done with a job
-# **Don't use method this if you have more than one job**          
-      - name: Delete Runner
-        run: echo "Deleting Runner..."
-      - uses: iunu/gce-github-runner@iunu
-        with:
-          command: stop
-        if: ${{ true || always() || failure() || success() || cancelled() || needs.*.result == 'skipped' }}            
 ```
 
- * `create-runner` creates the GCE VM and registers the runner with unique label
- * `test` uses the runner
- * the runner VM will be automatically shut down after the workflow via [self-hosted runner hook](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job)
+* `create-runner` creates the GCE VM and registers it under a unique `label`, output for the next job to target via `runs-on`.
+* `test` runs on that VM.
+* Once `test` finishes, the runner hook installed on the VM shuts it down within `shutdown_timeout` seconds; `deletion_timeout` guarantees teardown even if that hook fails.
 
-Due to bugs with runners not or overzealously shutting down if you have multiple jobs you can reliably shutdown the runners with a `workflow_run` file that runs after your workflow. Make sure the `workflows:` value(s) match the `name:` of the workflow you created:
+`token`, `project_id`, and `service_account_key` are the only inputs every `start` call needs to supply explicitly; everything else has a workable default — see [Inputs](#inputs).
+
+## Multiple jobs on the same runner: explicit `stop`
+
+The shutdown hook fires per-job, which can tear the VM down too early (or not at all) once more than one job shares it. For that case, add an explicit `command: stop` step. It runs **on the GCE runner itself**, not on a hosted runner, and needs no credentials or GCE inputs beyond `command: stop` — it reads its own instance name/zone from the VM's metadata server:
+
+```yaml
+jobs:
+  create-runner:
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.create-runner.outputs.label }}
+    steps:
+      - name: Create Runner
+        id: create-runner
+        uses: iunu/gce-github-runner@iunu
+        with:
+          token: ${{ secrets.GH_PAT_TOKEN }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          machine_zone: 'us-central1-c'
+          machine_type: 'c2-standard-4'
+          preemptible: true
+          no_external_address: true
+
+  build:
+    needs: create-runner
+    runs-on: ${{ needs.create-runner.outputs.label }}
+    steps:
+      - run: echo "build step"
+
+  test:
+    needs: [create-runner, build]
+    runs-on: ${{ needs.create-runner.outputs.label }}
+    steps:
+      - run: echo "test step"
+      - name: Stop Runner
+        uses: iunu/gce-github-runner@iunu
+        with:
+          command: stop
+        if: always()
+```
+
+Because ordinary job failures can skip downstream jobs, this pattern is unreliable once jobs might get skipped. Two more robust alternatives:
+
+**A `workflow_run` cleanup workflow**, matching `workflows:` to the `name:` of your main workflow:
 
 ```yaml
 name: Runner Cleanup
@@ -74,7 +124,8 @@ jobs:
           command: stop
         if: always()
 ```
-Similarly you could call another workflow and pass the runner label to it, but due to issues with skipping jobs you may not be able to reliably get this to run: 
+
+**A reusable `workflow_call` workflow**, passing in the runner label explicitly:
 
 ```yaml
 name: Runner Cleanup Reusable Workflow
@@ -95,7 +146,8 @@ jobs:
           command: stop
         if: always()
 ```
-This would be called something like this where filename is the name of the yaml above:
+
+Called like:
 
 ```yaml
 jobs:
@@ -105,6 +157,110 @@ jobs:
       runner: ${{ steps.create-runner.outputs.label }}
 ```
 
+## Pooled / reusable runners
+
+By default every workflow run gets its own throwaway VM, deleted when the job finishes. For a
+sequence of pushes to the same open PR, that means paying full VM boot + runner install +
+dependency install/compile cost every single time.
+
+Setting `reuse_key` opts into pooled mode instead: the VM is named deterministically from that
+key (plus repo context), **stopped** (not deleted) when idle, and **resumed** (not recreated) the
+next time a run with the same `reuse_key` needs a runner — skipping install/registration entirely,
+and, as a side effect, keeping anything left on disk (build/dependency caches) from the prior run.
+
+**1. Create/resume the pooled runner** — same `start` call as above, plus `reuse_key`:
+
+```yaml
+jobs:
+  create-runner:
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.create-runner.outputs.label }}
+    steps:
+      - name: Create Runner
+        id: create-runner
+        uses: iunu/gce-github-runner@iunu
+        with:
+          token: ${{ secrets.GH_PAT_TOKEN }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          machine_zone: 'us-central1-c'
+          machine_type: 'c2-standard-4'
+          preemptible: true
+          reuse_key: pr-${{ github.event.pull_request.number }}
+
+  test:
+    needs: create-runner
+    runs-on: ${{ needs.create-runner.outputs.label }}
+    steps:
+      - run: echo "This runs on the pooled GCE VM"
+```
+
+**2. Stop when idle** — nothing changes here: whichever `command: stop` pattern you use above
+automatically **stops** rather than deletes a pooled VM, since that behavior is baked into the VM
+at creation time.
+
+**3. Reclaim it eventually** — a stopped pooled VM is never deleted on its own, so wire a
+`command: delete` step to your own PR-closed (or branch-deleted) trigger, using the **same
+`reuse_key`, `machine_zone`, and (if used) `machine_zones`** that were used to create it (instance
+names are zone-scoped, and `reuse_key` is an opaque string the action doesn't interpret, so it
+must match exactly):
+
+```yaml
+name: Runner Pool Cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  delete-pooled-runner:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: iunu/gce-github-runner@iunu
+        with:
+          command: delete
+          token: ${{ secrets.GH_PAT_TOKEN }}
+          reuse_key: pr-${{ github.event.pull_request.number }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          machine_zone: 'us-central1-c'
+```
+
+`delete` needs `token` (to deregister the runner from GitHub), `reuse_key` (to compute which VM
+to target), and `project_id`/`service_account_key`/`machine_zone` (to authenticate and locate it)
+— it does not need any of the machine-shape inputs (`machine_type`, `image_family`, etc.), since
+it's only ever destroying, never creating.
+
+This step is safe to run even if CI never executed on that PR — it's a no-op if the VM doesn't exist.
+It also deregisters the runner from GitHub (via the API, using `token`) if one is found, since a
+pooled runner is always non-ephemeral and would otherwise sit "Offline" in the GitHub Actions UI
+for up to 30 days after its VM is gone, until GitHub's own stale-runner cleanup catches up.
+
+If you also use `machine_zones` fallback (see below) together with `reuse_key`, the pooled VM may
+land in a fallback zone rather than your static `machine_zone` input. Both `start` (looking up an
+existing pooled VM to resume) and `delete` search every zone in `machine_zone` + `machine_zones`
+(GCE instance names are unique per-zone, not per-project) — so pass the **same `machine_zone` and
+`machine_zones` values** to every `start` and `delete` call for a given `reuse_key`, and the VM
+will be found regardless of which zone it actually landed in. If you don't — e.g. a `delete` step
+that omits `machine_zones` — the search may miss it, leaving an orphaned VM running, or (worse, on
+`start`) conclude none exists and create a duplicate with the same name in another zone. Note
+resuming a pooled VM never gets zone fallback on a stockout — its disk is pinned to whichever zone
+it was originally created in.
+
+**Limitations to be aware of:**
+
+* **Security**: pooled VMs are non-ephemeral by design, and disk state (including anything a prior
+  job left behind) persists across runs sharing a `reuse_key`. This raises the stakes of the
+  [public-repo warning below](#self-hosted-runner-security-with-public-repositories) considerably if
+  `reuse_key` can ever be influenced by an untrusted contributor (e.g. derived from a branch name
+  they choose). Recommended only for private repos or trusted-contributor-only workflows.
+* **Concurrency**: two overlapping runs sharing a `reuse_key` don't run in parallel — GitHub only
+  ever dispatches one job at a time to a given self-hosted runner, so the second run's job queues
+  until the first finishes. This is expected behavior, not a bug.
+* **No auto-expiry**: nothing deletes a pooled VM on its own; cleanup is entirely the caller's
+  responsibility via `command: delete`.
+
 ## Inputs
 
 See inputs and descriptions [here](./action.yml).
@@ -113,6 +269,10 @@ The GCE runner image should have at least:
  * `gcloud`
  * `git`
  * (optionally) GitHub Actions Runner (see `actions_preinstalled` parameter)
+
+`project_id` and `service_account_key` are optional on `start`/`delete`: if omitted, `gcloud` must
+already be authenticated some other way in the calling job (e.g. via
+[`google-github-actions/auth`](https://github.com/google-github-actions/auth)).
 
 ## Zone fallback on capacity stockouts
 
@@ -140,93 +300,13 @@ The VM may land in a different zone than the `machine_zone` input if fallback wa
       zone: ${{ steps.create-runner.outputs.zone }}
 ```
 
+If you're using `reuse_key` together with `machine_zones`, see the note in
+[Pooled / reusable runners](#pooled--reusable-runners) about passing the same `machine_zones`
+value consistently to `delete` as well.
+
 ## Example Workflows
 
 * [Test Workflow](./.github/workflows/test.yml): Test workflow.
-
-## Pooled / reusable runners
-
-By default every workflow run gets its own throwaway VM, deleted when the job finishes. For a
-sequence of pushes to the same open PR, that means paying full VM boot + runner install +
-dependency install/compile cost every single time.
-
-Setting `reuse_key` opts into pooled mode instead: the VM is named deterministically from that
-key (plus repo context), **stopped** (not deleted) when idle, and **resumed** (not recreated) the
-next time a run with the same `reuse_key` needs a runner — skipping install/registration entirely,
-and, as a side effect, keeping anything left on disk (build/dependency caches) from the prior run.
-
-```yaml
-      - name: Create Runner
-        id: create-runner
-        uses: iunu/gce-github-runner@iunu
-        with:
-          token: ${{ secrets.GH_PAT_TOKEN }}
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-          service_account_key: ${{ secrets.GCP_SA_KEY }}
-          machine_zone: 'us-central1-c'
-          machine_type: 'c2-standard-4'
-          preemptible: true
-          reuse_key: pr-${{ github.event.pull_request.number }}
-```
-
-Nothing else about the calling job needs to change — the existing `command: stop` step (whichever
-pattern you use above) automatically **stops** rather than deletes a pooled VM, since that behavior
-is baked into the VM at creation time.
-
-Since a stopped pooled VM is never deleted on its own, you're responsible for reclaiming it. Wire a
-`command: delete` step to your own PR-closed (or branch-deleted) trigger, using the **same
-`reuse_key` and `machine_zone`** that were used to create it (instance names are zone-scoped, and
-`reuse_key` is an opaque string the action doesn't interpret, so it must match exactly):
-
-```yaml
-name: Runner Pool Cleanup
-
-on:
-  pull_request:
-    types: [closed]
-
-jobs:
-  delete-pooled-runner:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: iunu/gce-github-runner@iunu
-        with:
-          command: delete
-          token: ${{ secrets.GH_PAT_TOKEN }}
-          reuse_key: pr-${{ github.event.pull_request.number }}
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-          service_account_key: ${{ secrets.GCP_SA_KEY }}
-          machine_zone: 'us-central1-c'
-```
-
-This step is safe to run even if CI never executed on that PR — it's a no-op if the VM doesn't exist.
-It also deregisters the runner from GitHub (via the API, using `token`) if one is found, since a
-pooled runner is always non-ephemeral and would otherwise sit "Offline" in the GitHub Actions UI
-for up to 30 days after its VM is gone, until GitHub's own stale-runner cleanup catches up.
-
-If you also use `machine_zones` fallback (see above) together with `reuse_key`, the pooled VM may
-land in a fallback zone rather than your static `machine_zone` input. Both `start` (looking up an
-existing pooled VM to resume) and `delete` search every zone in `machine_zone` + `machine_zones`
-(GCE instance names are unique per-zone, not per-project) — so pass the **same `machine_zone` and
-`machine_zones` values** to every `start` and `delete` call for a given `reuse_key`, and the VM
-will be found regardless of which zone it actually landed in. If you don't — e.g. a `delete` step
-that omits `machine_zones` — the search may miss it, leaving an orphaned VM running, or (worse, on
-`start`) conclude none exists and create a duplicate with the same name in another zone. Note
-resuming a pooled VM never gets zone fallback on a stockout — its disk is pinned to whichever zone
-it was originally created in.
-
-**Limitations to be aware of:**
-
-* **Security**: pooled VMs are non-ephemeral by design, and disk state (including anything a prior
-  job left behind) persists across runs sharing a `reuse_key`. This raises the stakes of the
-  [public-repo warning below](#self-hosted-runner-security-with-public-repositories) considerably if
-  `reuse_key` can ever be influenced by an untrusted contributor (e.g. derived from a branch name
-  they choose). Recommended only for private repos or trusted-contributor-only workflows.
-* **Concurrency**: two overlapping runs sharing a `reuse_key` don't run in parallel — GitHub only
-  ever dispatches one job at a time to a given self-hosted runner, so the second run's job queues
-  until the first finishes. This is expected behavior, not a bug.
-* **No auto-expiry**: nothing deletes a pooled VM on its own; cleanup is entirely the caller's
-  responsibility via `command: delete`.
 
 ## Self-hosted runner security with public repositories
 

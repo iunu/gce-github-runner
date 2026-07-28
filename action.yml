@@ -100,11 +100,14 @@ inputs:
       deterministically named from this key plus repo context, stopped (not deleted)
       when idle, and resumed (not recreated) on the next `start` call with the same
       reuse_key -- skipping install/registration for a fast warm start, at the cost of
-      persisting disk state (build caches, etc.) between runs. Forces a non-ephemeral
-      runner regardless of the `ephemeral` input. Requires a companion `command: delete`
-      step (same reuse_key, machine_zone, and machine_zones) wired to your own
-      PR-closed/branch-deleted trigger -- there is no automatic expiry. Leave unset
-      (default) for today's behavior: a unique ephemeral VM per run, deleted when done.
+      persisting disk state (build caches, etc.) between runs. If `ephemeral` is also true,
+      the VM is always deleted (never stopped/pooled) after use instead, since a GitHub-side
+      ephemeral runner registration self-deregisters after one job and can't be reused
+      regardless of VM state -- `reuse_key` still gives it a deterministic name, but there's
+      nothing to warm-start. Requires a companion `command: delete` step (same reuse_key,
+      machine_zone, and machine_zones) wired to your own PR-closed/branch-deleted trigger for
+      the normal (non-ephemeral) case -- there is no automatic expiry. Leave unset (default)
+      for today's behavior: a unique ephemeral VM per run, deleted when done.
       See README.
     default: ""
     required: false
@@ -126,7 +129,8 @@ inputs:
     required: true
   deletion_timeout:
     description: >-
-      Safety-net VM deletion timeout (in seconds), used if the shutdown-hook mechanism fails to tear down the VM.
+      Safety-net VM teardown timeout (in seconds), used if the shutdown-hook mechanism fails to
+      tear down the VM -- stops a pooled (`reuse_key`) VM, deletes it otherwise.
       Clamped to 86400 (24h) when preemptible=true (GCE's hard preemptible limit), and to 259200 (3 days) in all cases
       (GitHub Actions' max workflow runtime).
     default: 3600

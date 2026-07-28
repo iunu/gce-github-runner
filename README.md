@@ -46,7 +46,7 @@ jobs:
           no_external_address: true
           actions_preinstalled: false
           shutdown_timeout: 60   # grace period given to the runner hook after a job finishes
-          deletion_timeout: 3600 # safety-net deletion if the shutdown hook never fires
+          deletion_timeout: 3600 # safety-net teardown if the shutdown hook never fires
 
   test:
     needs: create-runner
@@ -234,8 +234,9 @@ it's only ever destroying, never creating.
 
 This step is safe to run even if CI never executed on that PR — it's a no-op if the VM doesn't exist.
 It also deregisters the runner from GitHub (via the API, using `token`) if one is found, since a
-pooled runner is always non-ephemeral and would otherwise sit "Offline" in the GitHub Actions UI
-for up to 30 days after its VM is gone, until GitHub's own stale-runner cleanup catches up.
+pooled runner is normally non-ephemeral (unless `ephemeral: true` was also set — see below) and
+would otherwise sit "Offline" in the GitHub Actions UI for up to 30 days after its VM is gone,
+until GitHub's own stale-runner cleanup catches up.
 
 If you also use `machine_zones` fallback (see below) together with `reuse_key`, the pooled VM may
 land in a fallback zone rather than your static `machine_zone` input. Both `start` (looking up an
@@ -252,10 +253,17 @@ way a first-time create does — a stopped VM's disk can't be moved to another z
 this trades away that run's warm start (no cached build/dependency state) in exchange for the
 runner coming up at all instead of the whole workflow failing.
 
+If you also set `ephemeral: true` together with `reuse_key`, the VM is always **deleted** (not
+stopped) after use — a GitHub-side ephemeral runner registration self-deregisters after exactly
+one job and can never be reused no matter what happens to the VM, so stopping it for a later
+resume would provide no benefit. `reuse_key` still gives it a deterministic name; there's just
+nothing to warm-start, since every run creates fresh.
+
 **Limitations to be aware of:**
 
-* **Security**: pooled VMs are non-ephemeral by design, and disk state (including anything a prior
-  job left behind) persists across runs sharing a `reuse_key`. This raises the stakes of the
+* **Security**: pooled VMs are non-ephemeral by default (unless `ephemeral: true` is also set,
+  see above), and disk state (including anything a prior job left behind) persists across runs
+  sharing a `reuse_key`. This raises the stakes of the
   [public-repo warning below](#self-hosted-runner-security-with-public-repositories) considerably if
   `reuse_key` can ever be influenced by an untrusted contributor (e.g. derived from a branch name
   they choose). Recommended only for private repos or trusted-contributor-only workflows.
@@ -263,7 +271,10 @@ runner coming up at all instead of the whole workflow failing.
   ever dispatches one job at a time to a given self-hosted runner, so the second run's job queues
   until the first finishes. This is expected behavior, not a bug.
 * **No auto-expiry**: nothing deletes a pooled VM on its own; cleanup is entirely the caller's
-  responsibility via `command: delete`.
+  responsibility via `command: delete`. The one exception is a VM that never comes online in the
+  first place: if it fails to boot and register within 5 minutes of `start` (e.g. a corrupted
+  disk from a prior run), it's deleted rather than left stopped, so the next run gets a clean
+  rebuild instead of repeatedly retrying the same broken state.
 
 ## Inputs
 

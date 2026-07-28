@@ -246,6 +246,13 @@ function build_startup_script {
     fi
   fi
 
+  # Human-readable wording for the self-teardown messages baked into the startup script below.
+  # vm_teardown_action is "stop" for pooled VMs (reuse_key set) and "delete" otherwise -- the
+  # actual gcloud command already respects this (see shutdown.sh and the reaper line further
+  # down), this is just so the log messages don't falsely claim "deleting" when a pooled VM is
+  # actually just being stopped and preserved.
+  teardown_verb=$([[ "${vm_teardown_action}" == "stop" ]] && echo "stopping" || echo "deleting")
+
   startup_script="
 	# Create a systemd service in charge of shutting down the machine once the workflow has finished
 	cat <<-EOF > /etc/systemd/system/shutdown.sh
@@ -266,16 +273,21 @@ function build_startup_script {
 	chmod +x /etc/systemd/system/shutdown.sh
 	systemctl daemon-reload
 
+	# Recorded so a later, separate \`command: stop\` invocation (which runs as its own action.sh
+	# process on the VM, without vm_teardown_action in scope) can report the real teardown action
+	# too -- see stop_vm.
+	echo "${vm_teardown_action}" > /etc/gce-github-runner-teardown-action
+
 	cat <<-EOF > /usr/bin/gce_runner_shutdown.sh
 	#!/bin/sh
-	echo \"✅ Self deleting $VM_ID in ${machine_zone} in ${shutdown_timeout} seconds ...\"
+	echo \"✅ Self ${teardown_verb} $VM_ID in ${machine_zone} in ${shutdown_timeout} seconds ...\"
 	# We tear down the machine by starting the systemd service that was registered by the startup script
 	systemctl start shutdown@${shutdown_timeout}.service
 	EOF
 
 	cat <<-EOF > /usr/bin/gce_cancel_shutdown.sh
 	#!/bin/sh
-	echo \"✅ Cancelling deletion of $VM_ID in ${machine_zone}!\"
+	echo \"✅ Cancelling scheduled teardown of $VM_ID in ${machine_zone}!\"
 	# Stop the shutdown script
 	systemctl stop shutdown@${shutdown_timeout}.service
 	EOF
@@ -321,10 +333,17 @@ function start_vm {
 
   if [[ -n "${reuse_key}" ]]; then
     VM_ID="$(compute_pool_vm_name "${reuse_key}")"
-    vm_teardown_action="stop"
     if [[ "${ephemeral}" == "true" ]]; then
-      echo "⚠️ ephemeral=true is incompatible with reuse_key (ephemeral runners self-deregister after one job). Overriding to a persistent runner."
-      ephemeral="false"
+      # A GitHub-side ephemeral runner registration self-deregisters after exactly one job and
+      # can never be reused, no matter what happens to the VM -- so unlike a normal pooled VM,
+      # stopping this one to resume later would provide no benefit, just ongoing disk cost for a
+      # VM that can never do anything again. Always delete. reuse_key still gives it a
+      # deterministic name (e.g. useful for firewall rules or log correlation), but every run
+      # creates fresh: there's nothing to resume.
+      echo "ℹ️ ephemeral=true with reuse_key: this VM is deleted (not stopped) after use -- an ephemeral runner registration can't be reused regardless of VM state."
+      vm_teardown_action="delete"
+    else
+      vm_teardown_action="stop"
     fi
   else
     VM_ID="gce-gh-runner-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -546,6 +565,7 @@ function start_vm {
 
   safety_off
   runner_online="false"
+  gh_api_failures=0
   while (( i++ < 60 )); do
     GH_READY=$(gcloud compute instances describe ${VM_ID} --zone=${machine_zone} --format='json(labels)' | jq -r .labels.gh_ready)
     if [[ $GH_READY == 1 ]]; then
@@ -555,12 +575,31 @@ function start_vm {
       # resumed pooled VM whose registration was removed on GitHub's side while it sat stopped)
       # gets caught here instead of silently sitting there never receiving jobs.
       lookup="$(find_github_runner)"
-      gh_status="${lookup#* }"
+      IFS='|' read -r gh_api_ok _ gh_status <<< "${lookup}"
       if [[ "${gh_status}" == "online" ]]; then
         runner_online="true"
         break
       fi
-      echo "${VM_ID} booted (gh_ready=1) but GitHub reports it as '${gh_status:-not found yet}'; waiting 5 secs ..."
+
+      if [[ "${gh_api_ok}" == "false" ]]; then
+        # The lookup itself failed (GitHub API error/outage/rate-limit) -- this is not evidence
+        # the runner is broken, just that we can't currently confirm it either way. Don't let a
+        # run of these alone burn the whole 5-minute budget and delete an otherwise-healthy
+        # (gh_ready=1) VM over what's most likely transient and unrelated to this runner.
+        gh_api_failures=$((gh_api_failures + 1))
+        echo "${VM_ID} booted (gh_ready=1) but the GitHub API lookup itself failed (${gh_api_failures} consecutive failure(s)); waiting 5 secs ..."
+        if (( gh_api_failures >= 6 )); then
+          echo "⚠️ Could not reach the GitHub API to confirm online status after ~30s of repeated failures; trusting gh_ready=1 and proceeding." >&2
+          runner_online="true"
+          break
+        fi
+      else
+        # A successful lookup that found the runner missing/offline IS real signal (e.g. stale
+        # credentials on a resumed pooled VM) -- reset the failure streak and keep waiting/
+        # counting against the real timeout below instead of the API-failure fast path above.
+        gh_api_failures=0
+        echo "${VM_ID} booted (gh_ready=1) but GitHub reports it as '${gh_status:-not found yet}'; waiting 5 secs ..."
+      fi
     else
       echo "${VM_ID} not ready yet, waiting 5 secs ..."
     fi
@@ -569,6 +608,10 @@ function start_vm {
   if [[ "${runner_online}" == "true" ]]; then
     echo "✅ ${VM_ID} ready and online on GitHub ..."
   else
+    # Deliberately always deletes here, even for a pooled VM (vm_teardown_action would say
+    # "stop") -- a VM that never came online is presumed to have some form of corrupted state
+    # (bad disk, broken registration, etc.), so we discard it rather than leave it stopped to
+    # fail the exact same way on every future resume.
     echo "Waited 5 minutes for ${VM_ID} to come online, without luck, deleting ${VM_ID} ..."
     gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}
     exit 1
@@ -584,16 +627,27 @@ function stop_vm {
   # TODO: RUNNER_ALLOW_RUNASROOT=1 /actions-runner/config.sh remove --token $TOKEN
   NAME=$(curl -S -s -X GET http://metadata.google.internal/computeMetadata/v1/instance/name -H 'Metadata-Flavor: Google')
   ZONE=$(curl -S -s -X GET http://metadata.google.internal/computeMetadata/v1/instance/zone -H 'Metadata-Flavor: Google')
-  echo "✅ Self deleting $NAME in $ZONE in ${1} seconds ..."
+  # This runs as its own action.sh process, separate from the one that built the startup script,
+  # so it has no direct access to vm_teardown_action -- read the marker file build_startup_script
+  # left on disk instead. Default to "delete" (today's pre-pool-mode behavior) if it's missing --
+  # e.g. a VM created by an older version of this action, before this marker file existed.
+  teardown_action=$(cat /etc/gce-github-runner-teardown-action 2>/dev/null || echo "delete")
+  teardown_verb=$([[ "${teardown_action}" == "stop" ]] && echo "stopping" || echo "deleting")
+  echo "✅ Self ${teardown_verb} $NAME in $ZONE in ${1} seconds ..."
   # We tear down the machine by starting the systemd service that was registered by the startup script
   systemctl start shutdown@${1}.service
 }
 
 # Finds the GitHub Actions runner registered with VM_ID's custom label (set via
 # `config.sh --labels ${VM_ID}` at registration time; matching on that label is robust regardless
-# of the runner's hostname-derived name). Echoes "<id> <status>" on success (status is "online" or
-# "offline"); echoes nothing if not found, or if the API call itself failed (a warning is printed
-# to stderr in that case -- callers must treat empty output as "unknown", not "confirmed absent").
+# of the runner's hostname-derived name). Always echoes exactly one pipe-delimited line
+# "OK|ID|STATUS": OK is "true" if the API lookup itself succeeded (even if no runner matched, in
+# which case ID/STATUS are empty) or "false" if the API call itself failed (HTTP error), in which
+# case ID/STATUS are meaningless -- callers must treat that as "couldn't check", not "confirmed
+# absent". (This can't be surfaced via a plain global variable instead: every caller invokes this
+# via command substitution, e.g. `x=$(find_github_runner)`, which runs the function in a subshell
+# -- any variable it sets there is invisible to the caller once the subshell exits. The result
+# must travel back entirely through stdout.)
 function find_github_runner {
   local page=1 result="" runners_page runners_count http_status list_response
 
@@ -606,10 +660,11 @@ function find_github_runner {
     if [[ "${http_status}" != "200" ]]; then
       echo "⚠️ Could not list GitHub runners (HTTP ${http_status})." >&2
       echo "${runners_page}" >&2
+      echo "false||"
       return
     fi
 
-    result=$(jq -r --arg vm "${VM_ID}" '.runners[]? | select(.labels[]?.name == $vm) | "\(.id) \(.status)"' <<< "${runners_page}" | head -n1)
+    result=$(jq -r --arg vm "${VM_ID}" '.runners[]? | select(.labels[]?.name == $vm) | "\(.id)|\(.status)"' <<< "${runners_page}" | head -n1)
     runners_count=$(jq -r '.runners | length' <<< "${runners_page}")
     if [[ "${runners_count}" -lt 100 ]]; then
       break
@@ -617,7 +672,7 @@ function find_github_runner {
     page=$((page + 1))
   done
 
-  echo "${result}"
+  echo "true|${result}"
 }
 
 # Non-ephemeral runners (pool mode always is) don't self-deregister on VM shutdown -- without
@@ -626,10 +681,17 @@ function find_github_runner {
 # also cleans up an orphaned GitHub registration left over from a VM deleted some other way.
 function deregister_github_runner {
   echo "Looking up GitHub runner registration for ${VM_ID} ..."
-  local lookup runner_id
+  local lookup gh_api_ok runner_id
 
   lookup="$(find_github_runner)"
-  runner_id="${lookup%% *}"
+  IFS='|' read -r gh_api_ok runner_id _ <<< "${lookup}"
+
+  if [[ "${gh_api_ok}" == "false" ]]; then
+    # The lookup call itself failed (find_github_runner already logged why) -- this is not the
+    # same as confirming no registration exists, so don't report a false "nothing to deregister".
+    echo "⚠️ Could not confirm whether a GitHub runner registration exists for ${VM_ID} -- skipping deregistration." >&2
+    return
+  fi
 
   if [[ -z "${runner_id}" ]]; then
     echo "ℹ️ No GitHub runner registration found for ${VM_ID} — nothing to deregister."

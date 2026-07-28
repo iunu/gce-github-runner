@@ -309,6 +309,24 @@ function build_startup_script {
 	nohup sh -c \"sleep ${deletion_timeout} && gcloud --quiet compute instances ${vm_teardown_action} ${VM_ID} --zone=${machine_zone}\" > /dev/null &
   "
 
+  # GCE shutdown-script: a metadata key distinct from startup-script, invoked by the guest agent
+  # best-effort on ANY VM shutdown -- including preemption (GCE docs: ACPI G2 soft-off, ~30s
+  # window). This is the only teardown mechanism that can plausibly catch preemption: the
+  # job-completion runner hook and the in-guest reaper (both above) are themselves killed along
+  # with the guest OS the instant the host reclaims the VM, so neither ever gets a chance to run.
+  #
+  # Only ever set when vm_teardown_action=="delete" -- a plain ephemeral run, or a pooled+
+  # ephemeral run (neither can ever be reused regardless of VM state, see start_vm). Deliberately
+  # NEVER set when vm_teardown_action=="stop" (a pooled, non-ephemeral VM): those are meant to
+  # persist across any stop, preemption included, so they must never carry a self-delete script.
+  if [[ "${vm_teardown_action}" == "delete" ]]; then
+    shutdown_script="#!/bin/sh
+gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}
+"
+  else
+    shutdown_script=""
+  fi
+
   if $actions_preinstalled ; then
     echo "✅ Startup script won't install GitHub Actions (pre-installed)"
     startup_script="#!/bin/bash
@@ -498,13 +516,17 @@ function start_vm {
         ${maintenance_policy_flag} \
         "${min_cpu_platform_flag}" \
         --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}" \
-        --metadata=startup-script="$startup_script" 2>&1)
+        --metadata=^~~~^startup-script="$startup_script" 2>&1)
       create_rc=$?
       set -o errexit
 
       if [[ ${create_rc} -eq 0 ]]; then
         echo "${create_output}"
         create_succeeded="true"
+        if [[ -n "${shutdown_script}" ]]; then
+          gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} \
+            --metadata=^~~~^shutdown-script="$shutdown_script"
+        fi
         break
       elif grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${create_output}"; then
         echo "⚠️ Zone ${candidate_zone} appears to be out of capacity (stockout); trying next zone if available." >&2
@@ -531,9 +553,24 @@ function start_vm {
       # stopped.
       build_startup_script
 
+      # Same rationale/gating as create_fresh_vm -- this branch is only ever reached for a
+      # pooled VM (reuse_key set). Normally that means vm_teardown_action=="stop" (persist, no
+      # shutdown-script), but if this specific VM was previously pooled+ephemeral and got
+      # preempted before it could self-delete, it's still found here on resume with
+      # vm_teardown_action=="delete" -- so it must be re-armed with a shutdown-script too, the
+      # same as a fresh create, rather than assuming resume always means "persist".
+      #
+      # Two separate add-metadata calls (one key each), not one call listing both --metadata
+      # flags: gcloud's ArgDict parsing behavior for a single flag specified multiple times on
+      # one command line isn't clearly documented, so this avoids relying on it.
       set +o errexit
       start_output=$( (gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \
-        gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} --metadata=startup-script="$startup_script" && \
+        gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} --metadata=^~~~^startup-script="$startup_script" && \
+        if [[ -n "${shutdown_script}" ]]; then
+          gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} --metadata=^~~~^shutdown-script="$shutdown_script"
+        else
+          true
+        fi && \
         gcloud compute instances start ${VM_ID} --zone=${machine_zone}) 2>&1)
       start_rc=$?
       set -o errexit

@@ -36,9 +36,14 @@ inputs:
     description: >-
       Optional comma-separated list of additional zones to try, in order, if `machine_zone`
       (or an earlier fallback) fails with a capacity stockout (preemptible/spot VMs can be
-      rejected with ZONE_RESOURCE_POOL_EXHAUSTED when a zone is out of capacity). Only applies
-      to fresh VM creation, not to resuming an existing pooled (`reuse_key`) VM. Leave unset
-      (default) to keep today's behavior: only `machine_zone` is tried.
+      rejected with ZONE_RESOURCE_POOL_EXHAUSTED when a zone is out of capacity). With
+      `reuse_key`, these zones are also searched (alongside `machine_zone`) when looking for an
+      existing pooled VM, since GCE instance names are unique per-zone, not per-project -- a
+      pooled VM created via fallback may be sitting in any of them. Pass the same value
+      consistently across `start` and `delete` calls for a given `reuse_key` so it can always be
+      found. Resuming an existing pooled VM never itself gets zone *fallback* on a stockout (its
+      disk is pinned to whichever zone it's already in). Leave unset (default) to keep today's
+      behavior: only `machine_zone` is tried.
     default: ""
     required: false
   machine_type:
@@ -95,9 +100,10 @@ inputs:
       reuse_key -- skipping install/registration for a fast warm start, at the cost of
       persisting disk state (build caches, etc.) between runs. Forces a non-ephemeral
       runner regardless of the `ephemeral` input. Requires a companion `command: delete`
-      step (same reuse_key and machine_zone) wired to your own PR-closed/branch-deleted
-      trigger -- there is no automatic expiry. Leave unset (default) for today's
-      behavior: a unique ephemeral VM per run, deleted when done. See README.
+      step (same reuse_key, machine_zone, and machine_zones) wired to your own
+      PR-closed/branch-deleted trigger -- there is no automatic expiry. Leave unset
+      (default) for today's behavior: a unique ephemeral VM per run, deleted when done.
+      See README.
     default: ""
     required: false
   no_external_address:
@@ -149,9 +155,7 @@ outputs:
   zone:
     description: >-
       The zone the VM actually landed in (may differ from the `machine_zone` input if
-      `machine_zones` fallback was used). Capture this and use it instead of the static
-      `machine_zone` input for any subsequent `command: delete` step when using `reuse_key`
-      together with `machine_zones`.
+      `machine_zones` fallback was used).
     value: ${{ steps.gce-github-runner-script.outputs.zone }}
 runs:
   using: "composite"

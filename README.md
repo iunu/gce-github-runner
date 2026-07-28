@@ -205,11 +205,15 @@ pooled runner is always non-ephemeral and would otherwise sit "Offline" in the G
 for up to 30 days after its VM is gone, until GitHub's own stale-runner cleanup catches up.
 
 If you also use `machine_zones` fallback (see above) together with `reuse_key`, the pooled VM may
-land in a fallback zone rather than your static `machine_zone` input. Capture the `zone` output
-from the `create` step and pass it as `machine_zone` to your `command: delete` step instead of the
-static value, or `delete` won't find it (zone-scoped names). Note resuming a pooled VM never gets
-zone fallback — its disk is pinned to whichever zone it was originally created in, so a stockout
-on resume simply fails rather than trying another zone.
+land in a fallback zone rather than your static `machine_zone` input. Both `start` (looking up an
+existing pooled VM to resume) and `delete` search every zone in `machine_zone` + `machine_zones`
+(GCE instance names are unique per-zone, not per-project) — so pass the **same `machine_zone` and
+`machine_zones` values** to every `start` and `delete` call for a given `reuse_key`, and the VM
+will be found regardless of which zone it actually landed in. If you don't — e.g. a `delete` step
+that omits `machine_zones` — the search may miss it, leaving an orphaned VM running, or (worse, on
+`start`) conclude none exists and create a duplicate with the same name in another zone. Note
+resuming a pooled VM never gets zone fallback on a stockout — its disk is pinned to whichever zone
+it was originally created in.
 
 **Limitations to be aware of:**
 

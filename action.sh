@@ -331,32 +331,50 @@ function start_vm {
     vm_teardown_action="delete"
   fi
 
+  # zones_to_try: machine_zone first, then any machine_zones fallbacks, in order. Built once and
+  # shared between the pooled-VM lookup below and the create fallback loop further down -- GCE
+  # instance names are unique per-zone, not per-project, so a pooled VM that landed in a fallback
+  # zone on a prior run is invisible to a lookup that only checks the static machine_zone. Missing
+  # it there doesn't fail safely: it looks exactly like "doesn't exist yet" and leads straight to
+  # creating a second, identically-named VM in another zone -- both then racing to register the
+  # same GitHub runner label.
+  zones_to_try=("${machine_zone}")
+  if [[ -n "${machine_zones}" ]]; then
+    IFS=',' read -ra fallback_zone_list <<< "${machine_zones}"
+    zones_to_try+=("${fallback_zone_list[@]}")
+  fi
+
   pool_action="create"
   if [[ -n "${reuse_key}" ]]; then
-    set +o errexit
-    describe_output=$(gcloud compute instances describe "${VM_ID}" --zone=${machine_zone} --format='value(status)' 2>&1)
-    describe_rc=$?
-    set -o errexit
+    for candidate_zone in "${zones_to_try[@]}"; do
+      set +o errexit
+      describe_output=$(gcloud compute instances describe "${VM_ID}" --zone="${candidate_zone}" --format='value(status)' 2>&1)
+      describe_rc=$?
+      set -o errexit
 
-    if [[ ${describe_rc} -eq 0 ]]; then
-      existing_status="${describe_output}"
-      if [[ "${existing_status}" == "RUNNING" ]]; then
-        echo "✅ Pooled VM ${VM_ID} already RUNNING; reusing as-is."
-        pool_action="reuse-running"
-      else
-        echo "Pooled VM ${VM_ID} exists (state ${existing_status}); resuming (warm start)."
-        pool_action="start"
+      if [[ ${describe_rc} -eq 0 ]]; then
+        machine_zone="${candidate_zone}"
+        existing_status="${describe_output}"
+        if [[ "${existing_status}" == "RUNNING" ]]; then
+          echo "✅ Pooled VM ${VM_ID} already RUNNING in ${machine_zone}; reusing as-is."
+          pool_action="reuse-running"
+        else
+          echo "Pooled VM ${VM_ID} exists in ${machine_zone} (state ${existing_status}); resuming (warm start)."
+          pool_action="start"
+        fi
+        break
+      elif ! grep -qi 'was not found' <<< "${describe_output}"; then
+        # Anything other than a genuine 404 (permissions, transient API error, etc.) must not be
+        # silently treated as "doesn't exist" -- that's exactly what leads to a confusing
+        # "already exists" failure later from `create`, against a VM that was there all along.
+        echo "❌ Could not determine whether pooled VM ${VM_ID} already exists in ${candidate_zone}:" >&2
+        echo "${describe_output}" >&2
+        exit 1
       fi
-    elif grep -qi 'was not found' <<< "${describe_output}"; then
-      echo "No existing pooled VM ${VM_ID} found; will create it."
-      pool_action="create"
-    else
-      # Anything other than a genuine 404 (permissions, transient API error, etc.) must not be
-      # silently treated as "doesn't exist" -- that's exactly what leads to a confusing
-      # "already exists" failure later from `create`, against a VM that was there all along.
-      echo "❌ Could not determine whether pooled VM ${VM_ID} already exists:" >&2
-      echo "${describe_output}" >&2
-      exit 1
+    done
+
+    if [[ "${pool_action}" == "create" ]]; then
+      echo "No existing pooled VM ${VM_ID} found in any candidate zone (${zones_to_try[*]}); will create it."
     fi
   fi
 
@@ -433,12 +451,7 @@ function start_vm {
 
       # Zone fallback: try machine_zone first, then any machine_zones fallbacks in order, on a
       # capacity stockout (ZONE_RESOURCE_POOL_EXHAUSTED). Non-stockout errors fail immediately.
-      zones_to_try=("${machine_zone}")
-      if [[ -n "${machine_zones}" ]]; then
-        IFS=',' read -ra fallback_zone_list <<< "${machine_zones}"
-        zones_to_try+=("${fallback_zone_list[@]}")
-      fi
-
+      # (zones_to_try was already built above, shared with the pooled-VM lookup.)
       create_succeeded="false"
       for candidate_zone in "${zones_to_try[@]}"; do
         machine_zone="${candidate_zone}"
@@ -627,25 +640,42 @@ function delete_vm {
 
   deregister_github_runner
 
-  set +o errexit
-  describe_output=$(gcloud compute instances describe "${VM_ID}" --zone=${machine_zone} 2>&1)
-  exists_rc=$?
-  set -o errexit
-
-  if [[ ${exists_rc} -ne 0 ]]; then
-    if grep -qi 'was not found' <<< "${describe_output}"; then
-      echo "ℹ️ ${VM_ID} does not exist (already deleted, or CI never ran on this reuse_key) — nothing to do."
-      return
-    fi
-    # Anything other than a genuine 404 must not be silently treated as "already gone" -- that
-    # would leave a real VM (and its cost) behind with no indication cleanup actually failed.
-    echo "❌ Could not determine whether ${VM_ID} exists:" >&2
-    echo "${describe_output}" >&2
-    exit 1
+  # Search every candidate zone (machine_zone plus any machine_zones fallbacks), not just the
+  # static machine_zone -- a pooled VM created via zone fallback may be sitting in any of them,
+  # and GCE instance names are unique per-zone, not per-project, so checking only machine_zone
+  # risks a false "doesn't exist" and leaving the real VM (and its cost) running indefinitely.
+  zones_to_try=("${machine_zone}")
+  if [[ -n "${machine_zones}" ]]; then
+    IFS=',' read -ra fallback_zone_list <<< "${machine_zones}"
+    zones_to_try+=("${fallback_zone_list[@]}")
   fi
 
-  gcloud --quiet compute instances delete "${VM_ID}" --zone=${machine_zone}
-  echo "✅ Deleted ${VM_ID}."
+  found_zone=""
+  for candidate_zone in "${zones_to_try[@]}"; do
+    set +o errexit
+    describe_output=$(gcloud compute instances describe "${VM_ID}" --zone="${candidate_zone}" 2>&1)
+    exists_rc=$?
+    set -o errexit
+
+    if [[ ${exists_rc} -eq 0 ]]; then
+      found_zone="${candidate_zone}"
+      break
+    elif ! grep -qi 'was not found' <<< "${describe_output}"; then
+      # Anything other than a genuine 404 must not be silently treated as "already gone" -- that
+      # would leave a real VM (and its cost) behind with no indication cleanup actually failed.
+      echo "❌ Could not determine whether ${VM_ID} exists in ${candidate_zone}:" >&2
+      echo "${describe_output}" >&2
+      exit 1
+    fi
+  done
+
+  if [[ -z "${found_zone}" ]]; then
+    echo "ℹ️ ${VM_ID} does not exist in any candidate zone (${zones_to_try[*]}) -- already deleted, or CI never ran on this reuse_key -- nothing to do."
+    return
+  fi
+
+  gcloud --quiet compute instances delete "${VM_ID}" --zone="${found_zone}"
+  echo "✅ Deleted ${VM_ID} from ${found_zone}."
 }
 
 safety_on

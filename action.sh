@@ -213,7 +213,8 @@ function compute_pool_vm_name {
 
 # Builds the GCE startup-script metadata value (sets $startup_script as a side effect). Reads
 # VM_ID, machine_zone, vm_teardown_action, shutdown_timeout, deletion_timeout, GITHUB_REPOSITORY,
-# RUNNER_TOKEN, ephemeral_flag, actions_preinstalled, runner_ver, arm from the enclosing scope.
+# RUNNER_TOKEN, ephemeral_flag, actions_preinstalled, runner_ver, arm, and pool_action (create vs
+# start/resume -- defaults to create if unset) from the enclosing scope.
 # Safe to call more than once per start_vm invocation (e.g. once per zone-fallback attempt): the
 # "runner_ver=latest" resolution below mutates runner_ver to a concrete version on first call, so
 # the GitHub API lookup is automatically skipped on any later call.
@@ -253,9 +254,29 @@ function build_startup_script {
   # actually just being stopped and preserved.
   teardown_verb=$([[ "${vm_teardown_action}" == "stop" ]] && echo "stopping" || echo "deleting")
 
+  # The "/actions-runner/.runner already exists -> skip registration" guard below exists solely
+  # for RESUMED pooled VMs (their prior registration is still valid). On a fresh create it must
+  # not apply: a custom actions_preinstalled image baked from a once-registered VM can ship a
+  # leftover .runner file, and honoring it would skip registration entirely -- the runner never
+  # comes online and the readiness loop deletes the VM 5 minutes later. So fresh creates remove
+  # any stale registration state first, making the guard always take its register branch.
+  sanitize_cmds=""
+  if [[ "${pool_action:-create}" != "start" ]]; then
+    sanitize_cmds="rm -f /actions-runner/.runner /actions-runner/.credentials /actions-runner/.credentials_rsaparams && \\
+	"
+  fi
+
+  # NOTE for every heredoc below: the delimiter is QUOTED ('EOF') on purpose. These heredocs
+  # execute on the VM (level 2), and an unquoted delimiter would make the VM's shell expand any
+  # dollar-expression at file-WRITE time -- e.g. the sleep argument and machine_sa lookup in
+  # shutdown.sh would be replaced with empty strings as the file is written, deploying "sleep"
+  # with no argument and "gcloud --account=" with no account (which errors, so the VM never
+  # tears itself down). The backslash escapes on those same expressions protect level 1 (this
+  # action.sh string); the quoted delimiter protects level 2; the values expand at RUN time on
+  # the VM, as intended.
   startup_script="
 	# Create a systemd service in charge of shutting down the machine once the workflow has finished
-	cat <<-EOF > /etc/systemd/system/shutdown.sh
+	cat <<-'EOF' > /etc/systemd/system/shutdown.sh
 	#!/bin/sh
 	sleep \${1}
 	# A job step that ran on this VM may have called gcloud auth activate-service-account for
@@ -268,7 +289,7 @@ function build_startup_script {
 	gcloud --account=\${machine_sa} compute instances ${vm_teardown_action} $VM_ID --zone=$machine_zone --quiet
 	EOF
 
-	cat <<-EOF > /etc/systemd/system/shutdown\@.service
+	cat <<-'EOF' > /etc/systemd/system/shutdown\@.service
 	[Unit]
 	Description=Shutdown service in %i Seconds
 	[Service]
@@ -285,14 +306,14 @@ function build_startup_script {
 	# too -- see stop_vm.
 	echo "${vm_teardown_action}" > /etc/gce-github-runner-teardown-action
 
-	cat <<-EOF > /usr/bin/gce_runner_shutdown.sh
+	cat <<-'EOF' > /usr/bin/gce_runner_shutdown.sh
 	#!/bin/sh
 	echo \"✅ Self ${teardown_verb} $VM_ID in ${machine_zone} in ${shutdown_timeout} seconds ...\"
 	# We tear down the machine by starting the systemd service that was registered by the startup script
 	systemctl start shutdown@${shutdown_timeout}.service
 	EOF
 
-	cat <<-EOF > /usr/bin/gce_cancel_shutdown.sh
+	cat <<-'EOF' > /usr/bin/gce_cancel_shutdown.sh
 	#!/bin/sh
 	echo \"✅ Cancelling scheduled teardown of $VM_ID in ${machine_zone}!\"
 	# Stop the shutdown script
@@ -303,7 +324,7 @@ function build_startup_script {
 	echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/bin/gce_runner_shutdown.sh" >.env
   echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/bin/gce_cancel_shutdown.sh" >>.env
 	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \\
-	if [ ! -f /actions-runner/.runner ]; then
+	${sanitize_cmds}if [ ! -f /actions-runner/.runner ]; then
 	  ${runner_download_cmds}RUNNER_ALLOW_RUNASROOT=1 ./config.sh --url https://github.com/${GITHUB_REPOSITORY} --token ${RUNNER_TOKEN} --labels ${VM_ID} --unattended --replace ${ephemeral_flag} --disableupdate && \\
 	  ./svc.sh install
 	else
@@ -509,6 +530,16 @@ function start_vm {
       machine_zone="${candidate_zone}"
       build_startup_script
 
+      # One atomic --metadata argument carrying both scripts (the ^~~~^ custom-delimiter syntax
+      # from `gcloud topic escaping` separates dict ITEMS, so a second key rides along in the
+      # same flag). Setting shutdown-script in the create itself -- not a follow-up add-metadata
+      # call -- means there is no window where the VM exists but its preemption self-delete
+      # doesn't. Neither script may ever contain the literal sequence ~~~.
+      metadata_arg="--metadata=^~~~^startup-script=${startup_script}"
+      if [[ -n "${shutdown_script}" ]]; then
+        metadata_arg+="~~~shutdown-script=${shutdown_script}"
+      fi
+
       set +o errexit
       create_output=$(gcloud compute instances create ${VM_ID} \
         --zone=${machine_zone} \
@@ -528,17 +559,13 @@ function start_vm {
         ${maintenance_policy_flag} \
         "${min_cpu_platform_flag}" \
         --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}" \
-        --metadata=^~~~^startup-script="$startup_script" 2>&1)
+        "${metadata_arg}" 2>&1)
       create_rc=$?
       set -o errexit
 
       if [[ ${create_rc} -eq 0 ]]; then
         echo "${create_output}"
         create_succeeded="true"
-        if [[ -n "${shutdown_script}" ]]; then
-          gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} \
-            --metadata=^~~~^shutdown-script="$shutdown_script"
-        fi
         break
       elif grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${create_output}"; then
         echo "⚠️ Zone ${candidate_zone} appears to be out of capacity (stockout); trying next zone if available." >&2
@@ -572,17 +599,22 @@ function start_vm {
       # vm_teardown_action=="delete" -- so it must be re-armed with a shutdown-script too, the
       # same as a fresh create, rather than assuming resume always means "persist".
       #
-      # Two separate add-metadata calls (one key each), not one call listing both --metadata
-      # flags: gcloud's ArgDict parsing behavior for a single flag specified multiple times on
-      # one command line isn't clearly documented, so this avoids relying on it.
+      # Conversely, when this resume wants NO shutdown-script, any existing one must be actively
+      # REMOVED, not merely left un-updated: if this VM's previous life was pooled+ephemeral it
+      # still carries a self-DELETE shutdown-script, and a persistent pooled VM resumed with that
+      # in place would delete itself the first time it was idle-stopped.
+      metadata_arg="--metadata=^~~~^startup-script=${startup_script}"
+      shutdown_script_cleanup="true"
+      if [[ -n "${shutdown_script}" ]]; then
+        metadata_arg+="~~~shutdown-script=${shutdown_script}"
+      else
+        shutdown_script_cleanup="gcloud compute instances remove-metadata ${VM_ID} --zone=${machine_zone} --keys=shutdown-script"
+      fi
+
       set +o errexit
       start_output=$( (gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \
-        gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} --metadata=^~~~^startup-script="$startup_script" && \
-        if [[ -n "${shutdown_script}" ]]; then
-          gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} --metadata=^~~~^shutdown-script="$shutdown_script"
-        else
-          true
-        fi && \
+        gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} "${metadata_arg}" && \
+        ${shutdown_script_cleanup} && \
         gcloud compute instances start ${VM_ID} --zone=${machine_zone}) 2>&1)
       start_rc=$?
       set -o errexit

@@ -19,7 +19,8 @@ jobs:
           token: ${{ secrets.GH_PAT_TOKEN }}
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           service_account_key: ${{ secrets.GCP_SA_KEY }}
-          machine_zone: 'us-central1-c'
+          machine_zone: ${{ vars.RUNNER_ZONE }}
+          machine_zones: ${{ vars.RUNNER_ZONES }}
           machine_type: 't2d-standard-1'
           image_project: ubuntu-os-cloud
           image_family: ubuntu-2404-lts-amd64

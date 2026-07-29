@@ -22,8 +22,8 @@ jobs:
           machine_zone: ${{ vars.RUNNER_ZONE }}
           machine_zones: ${{ vars.RUNNER_ZONES }}
           machine_type: 't2d-standard-1'
-          image_project: ubuntu-os-cloud
-          image_family: ubuntu-2404-lts-amd64
+          image_project: prj-c-runners-bc7b
+          image_family: github-runner-ubuntu-2404-lts
           network: 'runner-net'
           subnet: 'runner-subnet'
           preemptible: true

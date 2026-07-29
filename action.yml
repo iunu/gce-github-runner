@@ -8,7 +8,7 @@ branding:
   color: purple
 inputs:
   command:
-    description: "`start` or `stop` of the runner"
+    description: "`start`, `stop`, or `delete` (pool-mode cleanup) of the runner"
     default: start
     required: true
   token:
@@ -32,6 +32,22 @@ inputs:
     description: GCE zone
     default: "us-central1-c"
     required: true
+  machine_zones:
+    description: >-
+      Optional comma-separated list of additional zones to try, in order, if `machine_zone`
+      (or an earlier fallback) fails with a capacity stockout (preemptible/spot VMs can be
+      rejected with ZONE_RESOURCE_POOL_EXHAUSTED when a zone is out of capacity). With
+      `reuse_key`, these zones are also searched (alongside `machine_zone`) when looking for an
+      existing pooled VM, since GCE instance names are unique per-zone, not per-project -- a
+      pooled VM created via fallback may be sitting in any of them. Pass the same value
+      consistently across `start` and `delete` calls for a given `reuse_key` so it can always be
+      found. If resuming an existing pooled VM hits a stockout in its own zone (its disk is
+      pinned there, so it can't just be started elsewhere), the VM/disk is deleted and a fresh
+      one is created instead, falling back across these same zones -- warm-start state is lost
+      for that run, but the runner still comes up. Leave unset (default) to keep today's
+      behavior: only `machine_zone` is tried.
+    default: ""
+    required: false
   machine_type:
     description: GCE machine type; https://cloud.google.com/compute/docs/machine-types
     default: "n1-standard-4"
@@ -57,7 +73,12 @@ inputs:
         Number of accelerators to attach to each instance. The default value is 1.
     required: false
   runner_service_account:
-    description: Service account of the VM, defaults to default compute service account.
+    description: >-
+      Service account of the VM, defaults to default compute service account. This account
+      must have compute.instances.delete and compute.instances.stop permission on itself -- the
+      VM's self-teardown logic (job-completion hook, safety-net reaper, and the shutdown-script
+      that handles preemption) explicitly runs as this account, overriding any other identity a
+      job step running on the VM may have separately authenticated as in the meantime.
     required: false
   image_project:
     description: >
@@ -78,6 +99,23 @@ inputs:
     description: Set GitHub runner to be ephemeral; https://docs.github.com/en/actions/hosting-your-own-runners/autoscaling-with-self-hosted-runners#using-ephemeral-runners-for-autoscaling
     default: false
     required: true
+  reuse_key:
+    description: >-
+      Optional pool key. When set, enables pooled/reusable-runner mode: the VM is
+      deterministically named from this key plus repo context, stopped (not deleted)
+      when idle, and resumed (not recreated) on the next `start` call with the same
+      reuse_key -- skipping install/registration for a fast warm start, at the cost of
+      persisting disk state (build caches, etc.) between runs. If `ephemeral` is also true,
+      the VM is always deleted (never stopped/pooled) after use instead, since a GitHub-side
+      ephemeral runner registration self-deregisters after one job and can't be reused
+      regardless of VM state -- `reuse_key` still gives it a deterministic name, but there's
+      nothing to warm-start. Requires a companion `command: delete` step (same reuse_key,
+      machine_zone, and machine_zones) wired to your own PR-closed/branch-deleted trigger for
+      the normal (non-ephemeral) case -- there is no automatic expiry. Leave unset (default)
+      for today's behavior: a unique ephemeral VM per run, deleted when done.
+      See README.
+    default: ""
+    required: false
   no_external_address:
     description: Disables external IP address for the worker
     default: false
@@ -93,6 +131,14 @@ inputs:
   finish_timeout:
     description: "Manual 'shutdown' commands grace period (in seconds) if called."
     default: 30
+    required: true
+  deletion_timeout:
+    description: >-
+      Safety-net VM teardown timeout (in seconds), used if the shutdown-hook mechanism fails to
+      tear down the VM -- stops a pooled (`reuse_key`) VM, deletes it otherwise.
+      Clamped to 86400 (24h) when preemptible=true (GCE's hard preemptible limit), and to 259200 (3 days) in all cases
+      (GitHub Actions' max workflow runtime).
+    default: 3600
     required: true
   actions_preinstalled:
     description: "Whether the GitHub actions have already been installed at `/actions-runner`."
@@ -117,6 +163,11 @@ outputs:
       Unique runner label. This label can be used to request a specific
       runner for the workflow job.
     value: ${{ steps.gce-github-runner-script.outputs.label }}
+  zone:
+    description: >-
+      The zone the VM actually landed in (may differ from the `machine_zone` input if
+      `machine_zones` fallback was used).
+    value: ${{ steps.gce-github-runner-script.outputs.zone }}
 runs:
   using: "composite"
   steps:
@@ -129,6 +180,7 @@ runs:
         --service_account_key='${{ inputs.service_account_key }}'
         --runner_ver=${{ inputs.runner_ver }}
         --machine_zone=${{ inputs.machine_zone }}
+        --machine_zones='${{ inputs.machine_zones }}'
         --machine_type=${{ inputs.machine_type }}
         --network=${{ inputs.network }}
         --subnet=${{ inputs.subnet }}
@@ -137,6 +189,7 @@ runs:
         --scopes=${{ inputs.scopes }}
         --shutdown_timeout=${{ inputs.shutdown_timeout }}
         --finish_timeout=${{ inputs.finish_timeout }}
+        --deletion_timeout=${{ inputs.deletion_timeout }}
         --runner_service_account=${{ inputs.runner_service_account }}
         --image_project=${{ inputs.image_project }}
         --image=${{ inputs.image }}
@@ -144,6 +197,7 @@ runs:
         --boot_disk_type=${{ inputs.boot_disk_type }}
         --preemptible=${{ inputs.preemptible }}
         --ephemeral=${{ inputs.ephemeral }}
+        --reuse_key='${{ inputs.reuse_key }}'
         --no_external_address=${{ inputs.no_external_address }}
         --actions_preinstalled=${{ inputs.actions_preinstalled }}
         --maintenance_policy_terminate=${{ inputs.maintenance_policy_terminate }}

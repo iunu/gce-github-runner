@@ -27,29 +27,20 @@ jobs:
           network: 'runner-net'
           subnet: 'runner-subnet'
           preemptible: true
-          actions_preinstalled: false
+          actions_preinstalled: true
           no_external_address: true
-          shutdown_timeout: 30
+          shutdown_timeout: 5
 
-  test1:
+  test-runner:
     needs: create-runner
     runs-on: ${{ needs.create-runner.outputs.label }}
     steps:
-      - name: Job 1 Test 
+      - name: Runner job test
         run: echo "This runs on the GCE runner VM"
 
-  test2:
-    needs: 
-      - create-runner
-      - test1
-    runs-on: ${{ needs.create-runner.outputs.label }}
-    steps:
-      - name: Wait for longer than shutdown timeout
-        run: sleep 60 #Give time for runner to shutdown from shutdown timeout
-
-      - name: Job 2 Test
-        run: echo "This also runs on the GCE runner VM"
-      - uses: iunu/gce-github-runner@iunu
-        with:
-          command: stop
-        if: always()
+      - name: Verify preinstalled runner image
+        run: |
+          test -d /actions-runner
+          test -x /actions-runner/config.sh
+          test -x /actions-runner/svc.sh
+          systemctl is-active actions.runner.*.service

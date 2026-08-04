@@ -198,7 +198,10 @@ jobs:
 
 **2. Stop when idle** — nothing changes here: whichever `command: stop` pattern you use above
 automatically **stops** rather than deletes a pooled VM, since that behavior is baked into the VM
-at creation time.
+at creation time. The stop is a plain guest-initiated poweroff (which lands the VM in TERMINATED
+exactly like an API stop, disk intact), so pooled runners need **no compute IAM permissions at
+all** on their service account — only ephemeral runners' self-*delete* needs
+`compute.instances.delete`.
 
 **3. Reclaim it eventually** — a stopped pooled VM is never deleted on its own, so wire a
 `command: delete` step to your own PR-closed (or branch-deleted) trigger, using the **same

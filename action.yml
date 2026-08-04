@@ -80,11 +80,14 @@ inputs:
     required: false
   runner_service_account:
     description: >-
-      Service account of the VM, defaults to default compute service account. This account
-      must have compute.instances.delete and compute.instances.stop permission on itself -- the
-      VM's self-teardown logic (job-completion hook, safety-net reaper, and the shutdown-script
-      that handles preemption) explicitly runs as this account, overriding any other identity a
-      job step running on the VM may have separately authenticated as in the meantime.
+      Service account of the VM, defaults to default compute service account. For ephemeral
+      (delete-mode) runners this account must have compute.instances.delete permission on
+      itself -- the VM's self-teardown logic (job-completion hook and safety-net reaper)
+      explicitly runs as this account, overriding any other identity a job step may have
+      separately authenticated as in the meantime; if the permission is missing, the VM powers
+      itself off instead (a TERMINATED leftover with disk cost, rather than a running zombie).
+      Pooled (`reuse_key`) runners need NO compute permissions: they idle-stop via a plain
+      guest-initiated poweroff, which lands the VM in TERMINATED exactly like an API stop.
     required: false
   image_project:
     description: >

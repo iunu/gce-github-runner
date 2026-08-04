@@ -327,19 +327,32 @@ function build_startup_script {
   # tears itself down). The backslash escapes on those same expressions protect level 1 (this
   # action.sh string); the quoted delimiter protects level 2; the values expand at RUN time on
   # the VM, as intended.
+  # The actual teardown command baked into shutdown.sh:
+  #
+  # stop-mode (pooled persistent VM): a plain guest-initiated poweroff. A VM that shuts itself
+  # down from inside lands in TERMINATED exactly like an API `compute instances stop` -- disk
+  # intact, resumable later -- but requires NO compute IAM permissions at all (the API call
+  # needs compute.instances.stop on the machine SA, which default compute SAs often lack).
+  #
+  # delete-mode (ephemeral): deletion is only possible through the API, so gcloud it is. The
+  # explicit --account matters: a job step may have run gcloud auth activate-service-account
+  # for its own purposes, which persists as gcloud's active identity for the rest of the VM's
+  # life -- force the VM's own attached SA rather than inheriting whatever identity is active.
+  # If the delete is denied anyway (machine SA lacks compute.instances.delete), fall back to
+  # poweroff: a TERMINATED leftover costing only its disk beats a RUNNING zombie burning CPU.
+  if [[ "${vm_teardown_action}" == "stop" ]]; then
+    teardown_cmds="systemctl poweroff"
+  else
+    teardown_cmds="machine_sa=\$(curl -S -s -X GET http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email -H 'Metadata-Flavor: Google')
+	gcloud --account=\${machine_sa} compute instances delete $VM_ID --zone=$machine_zone --quiet || { echo \"self-delete failed (missing compute.instances.delete on \${machine_sa}?); powering off instead.\"; systemctl poweroff; }"
+  fi
+
   startup_script="
 	# Create a systemd service in charge of shutting down the machine once the workflow has finished
 	cat <<-'EOF' > /etc/systemd/system/shutdown.sh
 	#!/bin/sh
 	sleep \${1}
-	# A job step that ran on this VM may have called gcloud auth activate-service-account for
-	# its own purposes (e.g. deploying/publishing something) which persists as gcloud's active
-	# identity for the rest of the VM's life. Explicitly force this VM's own attached service
-	# account here rather than silently inheriting whatever identity is currently active --
-	# otherwise this call can fail with a permission error from an unrelated SA or worse
-	# succeed using the wrong identity's permissions.
-	machine_sa=\$(curl -S -s -X GET http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email -H 'Metadata-Flavor: Google')
-	gcloud --account=\${machine_sa} compute instances ${vm_teardown_action} $VM_ID --zone=$machine_zone --quiet
+	${teardown_cmds}
 	EOF
 
 	cat <<-'EOF' > /etc/systemd/system/shutdown\@.service

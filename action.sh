@@ -24,6 +24,7 @@ runner_ver=
 machine_zone=
 machine_zones=
 machine_type=
+machine_types=
 boot_disk_type=
 disk_size=
 runner_service_account=
@@ -56,6 +57,7 @@ while getopts_long :h opt \
   machine_zone required_argument \
   machine_zones optional_argument \
   machine_type required_argument \
+  machine_types optional_argument \
   boot_disk_type optional_argument \
   disk_size optional_argument \
   runner_service_account optional_argument \
@@ -103,6 +105,9 @@ do
       ;;
     machine_type)
       machine_type=$OPTLARG
+      ;;
+    machine_types)
+      machine_types=${OPTLARG-$machine_types}
       ;;
     boot_disk_type)
       boot_disk_type=${OPTLARG-$boot_disk_type}
@@ -185,6 +190,23 @@ function gcloud_auth {
   echo "✅ Successfully configured gcloud."
 }
 
+# Splits a comma-separated list into one trimmed entry per line, dropping empty entries --
+# tolerating the whitespace and trailing commas users commonly write in YAML values (e.g.
+# "n2d-highcpu-16, c2-standard-16" or "us-central1-a,"). Without this, an entry like
+# " c2-standard-16" reaches an unquoted --machine-type=${...} expansion, word-splits into a
+# broken flag, and hard-fails the run looking like caller misconfiguration instead of being
+# tried as a fallback. Used for machine_zones (start_vm AND delete_vm) and machine_types.
+function split_csv {
+  local IFS=',' entry
+  for entry in $1; do
+    entry="${entry#"${entry%%[![:space:]]*}"}"   # ltrim
+    entry="${entry%"${entry##*[![:space:]]}"}"   # rtrim
+    if [[ -n "${entry}" ]]; then
+      echo "${entry}"
+    fi
+  done
+}
+
 # GCE instance names (unlike labels) must match ^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$ (<=63 chars,
 # no dots/underscores, must start with a letter). Used by both start_vm (pool mode) and delete_vm,
 # so it must be a top-level function -- delete_vm never calls start_vm.
@@ -213,8 +235,9 @@ function compute_pool_vm_name {
 
 # Builds the GCE startup-script metadata value (sets $startup_script as a side effect). Reads
 # VM_ID, machine_zone, vm_teardown_action, shutdown_timeout, deletion_timeout, GITHUB_REPOSITORY,
-# RUNNER_TOKEN, ephemeral_flag, actions_preinstalled, runner_ver, arm, and pool_action (create vs
-# start/resume -- defaults to create if unset) from the enclosing scope.
+# GITHUB_RUN_ID, RUNNER_TOKEN, token, preemptible, ephemeral_flag, actions_preinstalled,
+# runner_ver, arm, and pool_action (create vs start/resume -- defaults to create if unset) from
+# the enclosing scope.
 # Safe to call more than once per start_vm invocation (e.g. once per zone-fallback attempt): the
 # "runner_ver=latest" resolution below mutates runner_ver to a concrete version on first call, so
 # the GitHub API lookup is automatically skipped on any later call.
@@ -266,6 +289,58 @@ function build_startup_script {
 	"
   fi
 
+  # Preemption watcher: a tiny daemon (launched below like the reaper) that long-polls the
+  # metadata server's instance/preempted endpoint. GCE flips it to TRUE at the very START of the
+  # preemption sequence, so the watcher reacts with the network fully up and the whole ~30s
+  # window ahead of it -- unlike the shutdown-script, which races systemd's parallel teardown
+  # and empirically loses (the job then hangs ~10 minutes until GitHub's lost-communication
+  # timeout). On the notice it: (1) cancels the active workflow run via the GitHub API --
+  # deterministic, server-side, fails the job within seconds for BOTH ephemeral and pooled
+  # runners; (2) stops the runner service as a fallback signal; (3) on delete-mode VMs only,
+  # deregisters the runner (reading its agentId from the .runner file written at registration).
+  # Pooled persistent VMs never deregister -- their registration must survive to reconnect on
+  # resume. The run id to cancel comes from /actions-runner/.current-run-id, which the
+  # JOB_STARTED hook refreshes on every job (a pooled VM serves many runs; the create-time run
+  # id would go stale), falling back to the run id baked at create/resume time.
+  #
+  # SECURITY NOTE: this bakes the action's PAT (the token input) into the VM's startup-script
+  # metadata, readable by any process on the VM -- the same trust domain that already runs
+  # arbitrary workflow code. Only done for preemptible VMs (a non-preemptible VM can never be
+  # preempted, so it gets no token). Callers should prefer a PAT they can rotate easily.
+  watcher_dereg_cmds=""
+  if [[ "${vm_teardown_action}" == "delete" ]]; then
+    watcher_dereg_cmds="agent_id=\$(grep -o '\"agentId\" *: *[0-9]*' /actions-runner/.runner 2>/dev/null | tr -cd '0-9')
+	if [ -n \"\${agent_id}\" ]; then
+	  echo \"Deregistering runner id \${agent_id} from GitHub ...\"
+	  curl -S -s -X DELETE -H \"authorization: Bearer ${token}\" \"https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners/\${agent_id}\" || true
+	fi"
+  fi
+
+  watcher_setup=""
+  if [[ "${preemptible}" == "true" ]]; then
+    watcher_setup="
+	cat <<-'WEOF' > /usr/bin/gce_preemption_watcher.sh
+	#!/bin/sh
+	# Long-poll until GCE announces preemption (TRUE at the start of the ~30s notice window).
+	while :; do
+	  p=\$(curl -S -s -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/preempted?wait_for_change=true&timeout_sec=300' || true)
+	  [ \"\${p}\" = \"TRUE\" ] && break
+	  sleep 1
+	done
+	echo \"Preemption notice received for ${VM_ID}; failing the active run fast.\"
+	run_id=\$(cat /actions-runner/.current-run-id 2>/dev/null)
+	[ -n \"\${run_id}\" ] || run_id=\"${GITHUB_RUN_ID}\"
+	echo \"Cancelling workflow run \${run_id} ...\"
+	curl -S -s -X POST -H \"authorization: Bearer ${token}\" \"https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/\${run_id}/cancel\" || true
+	# Fallback signal: a gracefully-stopped runner reports a shutdown to GitHub if it can.
+	timeout 10 systemctl stop 'actions.runner.*' || true
+	${watcher_dereg_cmds}
+	WEOF
+	chmod +x /usr/bin/gce_preemption_watcher.sh
+	nohup /usr/bin/gce_preemption_watcher.sh >> /var/log/gce-preemption-watcher.log 2>&1 &
+	"
+  fi
+
   # NOTE for every heredoc below: the delimiter is QUOTED ('EOF') on purpose. These heredocs
   # execute on the VM (level 2), and an unquoted delimiter would make the VM's shell expand any
   # dollar-expression at file-WRITE time -- e.g. the sleep argument and machine_sa lookup in
@@ -274,19 +349,32 @@ function build_startup_script {
   # tears itself down). The backslash escapes on those same expressions protect level 1 (this
   # action.sh string); the quoted delimiter protects level 2; the values expand at RUN time on
   # the VM, as intended.
+  # The actual teardown command baked into shutdown.sh:
+  #
+  # stop-mode (pooled persistent VM): a plain guest-initiated poweroff. A VM that shuts itself
+  # down from inside lands in TERMINATED exactly like an API `compute instances stop` -- disk
+  # intact, resumable later -- but requires NO compute IAM permissions at all (the API call
+  # needs compute.instances.stop on the machine SA, which default compute SAs often lack).
+  #
+  # delete-mode (ephemeral): deletion is only possible through the API, so gcloud it is. The
+  # explicit --account matters: a job step may have run gcloud auth activate-service-account
+  # for its own purposes, which persists as gcloud's active identity for the rest of the VM's
+  # life -- force the VM's own attached SA rather than inheriting whatever identity is active.
+  # If the delete is denied anyway (machine SA lacks compute.instances.delete), fall back to
+  # poweroff: a TERMINATED leftover costing only its disk beats a RUNNING zombie burning CPU.
+  if [[ "${vm_teardown_action}" == "stop" ]]; then
+    teardown_cmds="systemctl poweroff"
+  else
+    teardown_cmds="machine_sa=\$(curl -S -s -X GET http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email -H 'Metadata-Flavor: Google')
+	gcloud --account=\${machine_sa} compute instances delete $VM_ID --zone=$machine_zone --quiet || { echo \"self-delete failed (missing compute.instances.delete on \${machine_sa}?); powering off instead.\"; systemctl poweroff; }"
+  fi
+
   startup_script="
 	# Create a systemd service in charge of shutting down the machine once the workflow has finished
 	cat <<-'EOF' > /etc/systemd/system/shutdown.sh
 	#!/bin/sh
 	sleep \${1}
-	# A job step that ran on this VM may have called gcloud auth activate-service-account for
-	# its own purposes (e.g. deploying/publishing something) which persists as gcloud's active
-	# identity for the rest of the VM's life. Explicitly force this VM's own attached service
-	# account here rather than silently inheriting whatever identity is currently active --
-	# otherwise this call can fail with a permission error from an unrelated SA or worse
-	# succeed using the wrong identity's permissions.
-	machine_sa=\$(curl -S -s -X GET http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email -H 'Metadata-Flavor: Google')
-	gcloud --account=\${machine_sa} compute instances ${vm_teardown_action} $VM_ID --zone=$machine_zone --quiet
+	${teardown_cmds}
 	EOF
 
 	cat <<-'EOF' > /etc/systemd/system/shutdown\@.service
@@ -318,11 +406,24 @@ function build_startup_script {
 	echo \"✅ Cancelling scheduled teardown of $VM_ID in ${machine_zone}!\"
 	# Stop the shutdown script
 	systemctl stop shutdown@${shutdown_timeout}.service
+	# Record the run id of the job that just started, so the preemption watcher cancels the run
+	# actually using this VM -- a pooled VM serves many runs, and the run id baked at
+	# create/resume time goes stale as soon as a later run's job lands here. (JOB_STARTED hooks
+	# run with the job's environment, so GITHUB_RUN_ID is the current run's id.) The if-form
+	# (not [ ] && ...) matters: a bare && chain as the script's last line would exit nonzero when
+	# the variable is empty, and a failing JOB_STARTED hook fails the job itself.
+	if [ -n \"\${GITHUB_RUN_ID}\" ]; then
+	  echo \"\${GITHUB_RUN_ID}\" > /actions-runner/.current-run-id
+	fi
 	EOF
 
 	# See: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job
 	echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/bin/gce_runner_shutdown.sh" >.env
   echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/bin/gce_cancel_shutdown.sh" >>.env
+	# Seed with the run id known at create/resume time; the JOB_STARTED hook above refreshes it
+	# per job so the preemption watcher always cancels the run actually using this VM.
+	echo "${GITHUB_RUN_ID}" > /actions-runner/.current-run-id
+	${watcher_setup}
 	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \\
 	${sanitize_cmds}if [ ! -f /actions-runner/.runner ]; then
 	  ${runner_download_cmds}RUNNER_ALLOW_RUNASROOT=1 ./config.sh --url https://github.com/${GITHUB_REPOSITORY} --token ${RUNNER_TOKEN} --labels ${VM_ID} --unattended --replace ${ephemeral_flag} --disableupdate && \\
@@ -342,22 +443,34 @@ function build_startup_script {
 
   # GCE shutdown-script: a metadata key distinct from startup-script, invoked by the guest agent
   # best-effort on ANY VM shutdown -- including preemption (GCE docs: ACPI G2 soft-off, ~30s
-  # window). This is the only teardown mechanism that can plausibly catch preemption: the
+  # window). This is the only in-guest mechanism that can react to preemption at all: the
   # job-completion runner hook and the in-guest reaper (both above) are themselves killed along
   # with the guest OS the instant the host reclaims the VM, so neither ever gets a chance to run.
   #
-  # Only ever set when vm_teardown_action=="delete" -- a plain ephemeral run, or a pooled+
-  # ephemeral run (neither can ever be reused regardless of VM state, see start_vm). Deliberately
-  # NEVER set when vm_teardown_action=="stop" (a pooled, non-ephemeral VM): those are meant to
-  # persist across any stop, preemption included, so they must never carry a self-delete script.
-  # Delegates to shutdown.sh (see its own comment) rather than calling gcloud directly here too,
-  # so the service-account fix above only has to exist in one place.
-  if [[ "${vm_teardown_action}" == "delete" ]]; then
-    shutdown_script="#!/bin/sh
-/etc/systemd/system/shutdown.sh 0
+  # BOTH modes stop the runner service first: a gracefully-stopped runner tells GitHub it is
+  # going away, so an in-flight job fails within seconds ("The runner has received a shutdown
+  # signal") instead of hanging ~10 minutes until GitHub's lost-communication timeout. Stopping
+  # the service does NOT deregister anything -- .runner/.credentials stay on disk, which is
+  # exactly right: a pooled VM's registration must survive preemption (resume re-runs svc.sh
+  # start and reconnects), and an ephemeral VM's orphaned registration is auto-purged by GitHub
+  # after 1 day offline. The timeout guard keeps a wedged systemctl from eating the whole
+  # preemption window.
+  #
+  # Only delete-mode VMs (plain ephemeral, or pooled+ephemeral) additionally self-delete via
+  # shutdown.sh -- an in-guest backup to the server-side Spot termination action DELETE set at
+  # create time (see preemptible_flag in start_vm), which also catches a delete-mode VM stopped
+  # some way other than preemption (e.g. manually from the console). A pooled persistent VM's
+  # script must NEVER touch the VM itself -- its disk is the whole point of pool mode.
+  # This string is consumed directly by the guest agent (never re-written through a VM-side
+  # heredoc), so level-1 backslash-escapes are the only quoting it needs.
+  shutdown_script="#!/bin/sh
+preempted=\$(curl -S -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/preempted)
+echo \"shutdown-script: preempted=\${preempted}; stopping the runner service so any in-flight job fails fast.\"
+timeout 10 systemctl stop 'actions.runner.*' || true
 "
-  else
-    shutdown_script=""
+  if [[ "${vm_teardown_action}" == "delete" ]]; then
+    shutdown_script+="/etc/systemd/system/shutdown.sh 0
+"
   fi
 
   if $actions_preinstalled ; then
@@ -409,22 +522,90 @@ function start_vm {
   # creating a second, identically-named VM in another zone -- both then racing to register the
   # same GitHub runner label.
   zones_to_try=("${machine_zone}")
-  if [[ -n "${machine_zones}" ]]; then
-    IFS=',' read -ra fallback_zone_list <<< "${machine_zones}"
-    zones_to_try+=("${fallback_zone_list[@]}")
-  fi
+  while IFS= read -r csv_entry; do
+    zones_to_try+=("${csv_entry}")
+  done < <(split_csv "${machine_zones}")
+
+  # types_to_try: machine_type first, then any machine_types fallbacks, in order. Shared by
+  # create_fresh_vm (type-major search: each type is tried across ALL zones before degrading to
+  # the next type -- zones within a region are near-interchangeable, while machine type actually
+  # changes build performance/cost) and by the pooled resume rescue (in-place set-machine-type).
+  types_to_try=("${machine_type}")
+  while IFS= read -r csv_entry; do
+    types_to_try+=("${csv_entry}")
+  done < <(split_csv "${machine_types}")
+
+  # Bounded wait until GCE stops returning the pooled VM at all (describe 404s). Used after
+  # issuing/observing a delete, so an immediate re-create can't collide with the name while the
+  # deletion is still completing server-side.
+  function wait_pooled_vm_gone {
+    local waited=0 gone_output gone_rc
+    while (( waited < 120 )); do
+      set +o errexit
+      gone_output=$(gcloud compute instances describe "${VM_ID}" --zone="${machine_zone}" --format='value(status)' 2>&1)
+      gone_rc=$?
+      set -o errexit
+      if [[ ${gone_rc} -ne 0 ]] && grep -qi 'was not found' <<< "${gone_output}"; then
+        return 0
+      fi
+      sleep 5
+      waited=$((waited + 5))
+    done
+    echo "⚠️ ${VM_ID} is still visible in ${machine_zone} after ${waited}s; a follow-up create may fail with alreadyExists." >&2
+  }
+
+  # Best-effort delete of the pooled VM, then wait for it to be fully gone. Tolerates the VM
+  # already being deleted (or mid-deletion by someone else); any other delete error is reported
+  # but not fatal -- the follow-up create fails loudly anyway if the VM truly still exists.
+  function delete_pooled_vm_and_wait_gone {
+    local del_output del_rc
+    set +o errexit
+    del_output=$(gcloud --quiet compute instances delete "${VM_ID}" --zone="${machine_zone}" 2>&1)
+    del_rc=$?
+    set -o errexit
+    if [[ ${del_rc} -ne 0 ]] && ! grep -qi 'was not found' <<< "${del_output}"; then
+      echo "⚠️ Deleting ${VM_ID} reported an error (continuing; the follow-up create will surface it if real):" >&2
+      echo "${del_output}" >&2
+    fi
+    wait_pooled_vm_gone
+  }
 
   pool_action="create"
   if [[ -n "${reuse_key}" ]]; then
     for candidate_zone in "${zones_to_try[@]}"; do
       set +o errexit
-      describe_output=$(gcloud compute instances describe "${VM_ID}" --zone="${candidate_zone}" --format='value(status)' 2>&1)
+      describe_output=$(gcloud compute instances describe "${VM_ID}" --zone="${candidate_zone}" --format='value(status,machineType)' 2>&1)
       describe_rc=$?
       set -o errexit
 
       if [[ ${describe_rc} -eq 0 ]]; then
         machine_zone="${candidate_zone}"
-        existing_status="${describe_output}"
+        # Two tab-separated fields: status, machineType URL (basename is the type name). The
+        # type feeds the machine_type output and lets the resume rescue skip re-trying the type
+        # the VM already has. Tolerate a missing second field (old mocks/edge responses).
+        read -r existing_status existing_machine_type_url <<< "${describe_output}"
+        existing_machine_type="${existing_machine_type_url##*/}"
+        existing_machine_type="${existing_machine_type:-unknown}"
+
+        # A VM mid-deletion still describes as RUNNING for tens of seconds -- and its stale
+        # gh_ready=1 label plus GitHub's lagging "online" runner status can pass every readiness
+        # check below, handing the job to a VM that is actively vanishing (observed in the
+        # wild: pooled VM manually deleted, immediately re-run, action declared it ready).
+        # An in-flight delete OPERATION is visible from T+0 though, so check for one before
+        # trusting the status. Best-effort: if the operations lookup itself fails (e.g. the
+        # workflow SA lacks zoneOperations.list), fall through to the status-based decision.
+        set +o errexit
+        pending_delete=$(gcloud compute operations list --zones="${machine_zone}" \
+          --filter="targetLink ~ /instances/${VM_ID}\$ AND operationType=delete AND NOT status=DONE" \
+          --format='value(name)' 2>/dev/null | head -n1)
+        set -o errexit
+        if [[ -n "${pending_delete}" ]]; then
+          echo "⚠️ Pooled VM ${VM_ID} in ${machine_zone} has an in-flight delete operation (${pending_delete}); waiting for it to finish, then creating fresh." >&2
+          wait_pooled_vm_gone
+          pool_action="create"
+          break
+        fi
+
         if [[ "${existing_status}" == "RUNNING" ]]; then
           echo "✅ Pooled VM ${VM_ID} already RUNNING in ${machine_zone}; reusing as-is."
           pool_action="reuse-running"
@@ -448,16 +629,22 @@ function start_vm {
     fi
   fi
 
-  if [[ "${pool_action}" == "create" || "${pool_action}" == "start" ]]; then
-    # build_startup_script always interpolates ${RUNNER_TOKEN} while constructing the script text
-    # (even though the resulting `config.sh --token ${RUNNER_TOKEN}` line only actually executes
-    # on the VM if /actions-runner/.runner is missing) -- so it must be a valid, non-crashing
-    # value under `nounset` on both the "create" and "start" (resume) paths, not just "create".
+  function fetch_runner_registration_token {
     RUNNER_TOKEN=$(curl -S -s -XPOST \
         -H "authorization: Bearer ${token}" \
         https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners/registration-token |\
         jq -r .token)
     echo "✅ Successfully got the GitHub Runner registration token"
+  }
+
+  if [[ "${pool_action}" == "create" || "${pool_action}" == "start" ]]; then
+    # build_startup_script always interpolates ${RUNNER_TOKEN} while constructing the script text
+    # (even though the resulting `config.sh --token ${RUNNER_TOKEN}` line only actually executes
+    # on the VM if /actions-runner/.runner is missing) -- so it must be a valid, non-crashing
+    # value under `nounset` on both the "create" and "start" (resume) paths, not just "create".
+    # (The reuse-running path skips this; if its readiness poll later falls back to a fresh
+    # create, that path fetches the token itself before calling create_fresh_vm.)
+    fetch_runner_registration_token
   fi
 
   service_account_flag=$([[ -z "${runner_service_account}" ]] || echo "--service-account=${runner_service_account}")
@@ -466,7 +653,18 @@ function start_vm {
   image_family_flag=$([[ -z "${image_family}" ]] || echo "--image-family=${image_family}")
   disk_size_flag=$([[ -z "${disk_size}" ]] || echo "--boot-disk-size=${disk_size}")
   boot_disk_type_flag=$([[ -z "${boot_disk_type}" ]] || echo "--boot-disk-type=${boot_disk_type}")
-  preemptible_flag=$([[ "${preemptible}" == "true" ]] && echo "--preemptible" || echo "")
+  # preemptible=true is implemented as Spot provisioning (same discount/preemption model as
+  # legacy --preemptible, minus its 24h forced-stop cap) because Spot unlocks
+  # --instance-termination-action: on preemption GCE ITSELF deletes a delete-mode VM (plain
+  # ephemeral, or pooled+ephemeral) server-side -- no reliance on the guest winning its ~30s
+  # best-effort shutdown window -- so a preempted ephemeral runner can never linger as a zombie
+  # TERMINATED instance. Pooled persistent VMs keep stop-on-preemption (their disk must survive).
+  if [[ "${preemptible}" == "true" ]]; then
+    spot_termination_action=$([[ "${vm_teardown_action}" == "delete" ]] && echo "DELETE" || echo "STOP")
+    preemptible_flag="--provisioning-model=SPOT --instance-termination-action=${spot_termination_action}"
+  else
+    preemptible_flag=""
+  fi
   ephemeral_flag=$([[ "${ephemeral}" == "true" ]] && echo "--ephemeral" || echo "")
   no_external_address_flag=$([[ "${no_external_address}" == "true" ]] && echo "--no-address" || echo "")
   network_flag=$([[ ! -z "${network}"  ]] && echo "--network=${network}" || echo "")
@@ -474,9 +672,10 @@ function start_vm {
   accelerator=$([[ ! -z "${accelerator}"  ]] && echo "--accelerator=${accelerator} --maintenance-policy=TERMINATE" || echo "")
   maintenance_policy_flag=$([[ -z "${maintenance_policy_terminate}"  ]] || echo "--maintenance-policy=TERMINATE" )
 
-  # Clamp deletion_timeout to real-world ceilings: GCE preemptible VMs are hard-terminated
-  # by Google after 24h regardless of anything else, and GitHub Actions workflow runs are
-  # capped at 3 days in all cases.
+  # Clamp deletion_timeout to real-world ceilings: GitHub Actions workflow runs are capped at
+  # 3 days in all cases. The tighter 24h ceiling for preemptible=true dates from legacy
+  # preemptible VMs' hard 24h termination; Spot provisioning (what preemptible=true creates
+  # now) has no such cap, but 24h remains a sane upper bound for a CI runner's safety net.
   deletion_timeout_max=259200
   if [[ "${preemptible}" == "true" ]]; then
     deletion_timeout_max=86400
@@ -514,18 +713,23 @@ function start_vm {
     echo -n "${in}"
   }
 
-  # Creates a brand-new VM, trying each zone in $zones_to_try in order on a capacity stockout
-  # (ZONE_RESOURCE_POOL_EXHAUSTED). Non-stockout errors fail immediately, no further zones tried.
-  # Sets $machine_zone as a side effect to whichever zone actually succeeded. Called both for a
-  # genuine first-time create, and as a fallback when resuming an existing pooled VM turns out to
-  # be impossible because its home zone is itself stocked out (see pool_action == "start" below).
+  # Creates a brand-new VM, walking the type x zone matrix on capacity stockouts
+  # (ZONE_RESOURCE_POOL_EXHAUSTED): type-major order -- each machine type in $types_to_try is
+  # tried across ALL zones in $zones_to_try before degrading to the next type. A combo is also
+  # skipped when the type simply isn't offered in that zone ("machineTypes/... was not found");
+  # any other error fails immediately with no further combos, so real misconfiguration stays
+  # loud. Sets $machine_zone and $machine_type as side effects to whichever combo succeeded.
+  # Called for a genuine first-time create, and as the fallback when a pooled VM can't be
+  # resumed or rescued (see pool_action == "start" below).
   function create_fresh_vm {
-    local gh_repo_owner gh_repo gh_run_id candidate_zone create_output create_rc
+    local gh_repo_owner gh_repo gh_run_id candidate_zone candidate_type create_output create_rc
     gh_repo_owner="$(truncate_to_label "${GITHUB_REPOSITORY_OWNER}")"
     gh_repo="$(truncate_to_label "${GITHUB_REPOSITORY##*/}")"
     gh_run_id="${GITHUB_RUN_ID}"
 
     create_succeeded="false"
+    for candidate_type in "${types_to_try[@]}"; do
+    machine_type="${candidate_type}"
     for candidate_zone in "${zones_to_try[@]}"; do
       machine_zone="${candidate_zone}"
       build_startup_script
@@ -533,12 +737,9 @@ function start_vm {
       # One atomic --metadata argument carrying both scripts (the ^~~~^ custom-delimiter syntax
       # from `gcloud topic escaping` separates dict ITEMS, so a second key rides along in the
       # same flag). Setting shutdown-script in the create itself -- not a follow-up add-metadata
-      # call -- means there is no window where the VM exists but its preemption self-delete
+      # call -- means there is no window where the VM exists but its preemption handling
       # doesn't. Neither script may ever contain the literal sequence ~~~.
-      metadata_arg="--metadata=^~~~^startup-script=${startup_script}"
-      if [[ -n "${shutdown_script}" ]]; then
-        metadata_arg+="~~~shutdown-script=${shutdown_script}"
-      fi
+      metadata_arg="--metadata=^~~~^startup-script=${startup_script}~~~shutdown-script=${shutdown_script}"
 
       set +o errexit
       create_output=$(gcloud compute instances create ${VM_ID} \
@@ -566,18 +767,22 @@ function start_vm {
       if [[ ${create_rc} -eq 0 ]]; then
         echo "${create_output}"
         create_succeeded="true"
-        break
+        break 2
       elif grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${create_output}"; then
-        echo "⚠️ Zone ${candidate_zone} appears to be out of capacity (stockout); trying next zone if available." >&2
+        echo "⚠️ ${candidate_type} in ${candidate_zone} is out of capacity (stockout); trying the next type/zone combo if available." >&2
+        echo "${create_output}" >&2
+      elif grep -qi "machineTypes/${candidate_type}' was not found" <<< "${create_output}"; then
+        echo "⚠️ ${candidate_type} is not offered in ${candidate_zone}; trying the next type/zone combo if available." >&2
         echo "${create_output}" >&2
       else
         echo "${create_output}" >&2
         exit 1
       fi
     done
+    done
 
     if [[ "${create_succeeded}" != "true" ]]; then
-      echo "❌ All candidate zones (${zones_to_try[*]}) are out of capacity." >&2
+      echo "❌ All machine type / zone combinations (types: ${types_to_try[*]}; zones: ${zones_to_try[*]}) are out of capacity or unavailable." >&2
       exit 1
     fi
   }
@@ -592,61 +797,89 @@ function start_vm {
       # stopped.
       build_startup_script
 
-      # Same rationale/gating as create_fresh_vm -- this branch is only ever reached for a
-      # pooled VM (reuse_key set). Normally that means vm_teardown_action=="stop" (persist, no
-      # shutdown-script), but if this specific VM was previously pooled+ephemeral and got
-      # preempted before it could self-delete, it's still found here on resume with
-      # vm_teardown_action=="delete" -- so it must be re-armed with a shutdown-script too, the
-      # same as a fresh create, rather than assuming resume always means "persist".
-      #
-      # Conversely, when this resume wants NO shutdown-script, any existing one must be actively
-      # REMOVED, not merely left un-updated: if this VM's previous life was pooled+ephemeral it
-      # still carries a self-DELETE shutdown-script, and a persistent pooled VM resumed with that
-      # in place would delete itself the first time it was idle-stopped.
-      metadata_arg="--metadata=^~~~^startup-script=${startup_script}"
-      shutdown_script_cleanup="true"
-      if [[ -n "${shutdown_script}" ]]; then
-        metadata_arg+="~~~shutdown-script=${shutdown_script}"
-      else
-        shutdown_script_cleanup="gcloud compute instances remove-metadata ${VM_ID} --zone=${machine_zone} --keys=shutdown-script"
-      fi
+      # Same rationale as create_fresh_vm's metadata_arg. Every resume overwrites BOTH scripts
+      # with ones built for the current mode, which also self-heals a stale shutdown-script left
+      # by this VM's previous life (e.g. once pooled+ephemeral with a self-DELETE script, now
+      # resumed as a persistent pooled VM whose script must only stop the runner service).
+      metadata_arg="--metadata=^~~~^startup-script=${startup_script}~~~shutdown-script=${shutdown_script}"
 
       set +o errexit
       start_output=$( (gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \
         gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} "${metadata_arg}" && \
-        ${shutdown_script_cleanup} && \
         gcloud compute instances start ${VM_ID} --zone=${machine_zone}) 2>&1)
       start_rc=$?
       set -o errexit
 
       if [[ ${start_rc} -eq 0 ]]; then
         echo "${start_output}"
-      elif grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${start_output}"; then
-        # The stopped VM's own zone is stocked out -- it can't be resumed there, and moving a
-        # disk across zones isn't a thing GCE supports in-place. Fall back to the same
-        # zone-fallback create used for a brand-new VM, sacrificing this run's warm start (the
-        # old VM/disk is deleted) in exchange for not just failing outright.
-        echo "⚠️ Zone ${machine_zone} is out of capacity to resume pooled VM ${VM_ID} (stockout); deleting it there and creating fresh in a fallback zone (pool warm-start lost for this run)." >&2
-        echo "${start_output}" >&2
-        gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}
-        pool_action="create"
-        create_fresh_vm
+        effective_machine_type="${existing_machine_type}"
       else
-        echo "${start_output}" >&2
-        exit 1
+        # ANY resume failure ends in delete-and-recreate-fresh, not just stockout: unlike the
+        # create path (where a failure usually means caller misconfiguration that must fail
+        # loudly), a failed START of a VM that verifiably exists means THIS VM can't serve --
+        # its zone is out of capacity, it's mid-deletion (a deleting VM still describes as
+        # existing for a while), stuck in a transitional state, or otherwise wedged.
+        #
+        # But a STOCKOUT specifically gets one better option first: change the machine type IN
+        # PLACE (set-machine-type is valid on a TERMINATED instance) and start again -- a
+        # different type draws on a different capacity pool in the same zone, and unlike
+        # delete-and-recreate it keeps the warm disk, which is the whole point of pool mode.
+        # Rescue failures are soft (incompatible fallback type, or that pool is dry too):
+        # just try the next candidate; delete+recreate remains the backstop, and genuine
+        # misconfiguration still fails loudly inside create_fresh_vm.
+        rescued="false"
+        if grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${start_output}"; then
+          echo "⚠️ ${existing_machine_type} is out of capacity in ${machine_zone} to resume pooled VM ${VM_ID} (stockout); attempting in-place machine-type rescue before recreating." >&2
+          echo "${start_output}" >&2
+          for candidate_type in "${types_to_try[@]}"; do
+            if [[ "${candidate_type}" == "${existing_machine_type}" ]]; then
+              continue
+            fi
+            echo "Rescue attempt: switching ${VM_ID} to ${candidate_type} in place (warm disk preserved) ..."
+            set +o errexit
+            rescue_output=$( (gcloud compute instances set-machine-type ${VM_ID} --zone=${machine_zone} --machine-type=${candidate_type} && \
+              gcloud compute instances start ${VM_ID} --zone=${machine_zone}) 2>&1)
+            rescue_rc=$?
+            set -o errexit
+            if [[ ${rescue_rc} -eq 0 ]]; then
+              echo "${rescue_output}"
+              echo "✅ Rescued pooled VM ${VM_ID} in place as ${candidate_type} (warm start preserved)."
+              effective_machine_type="${candidate_type}"
+              rescued="true"
+              break
+            fi
+            echo "⚠️ Rescue as ${candidate_type} failed (incompatible type, or its capacity pool is dry too); trying the next candidate if available." >&2
+            echo "${rescue_output}" >&2
+          done
+        else
+          echo "⚠️ Could not resume pooled VM ${VM_ID} in ${machine_zone} (mid-deletion, transitional state, or wedged); deleting it and creating fresh (pool warm-start lost for this run)." >&2
+          echo "${start_output}" >&2
+        fi
+
+        if [[ "${rescued}" != "true" ]]; then
+          delete_pooled_vm_and_wait_gone
+          pool_action="create"
+          create_fresh_vm
+          effective_machine_type="${machine_type}"
+        fi
       fi
     fi
     echo "label=${VM_ID}" >> $GITHUB_OUTPUT
     echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
+    echo "machine_type=${effective_machine_type:-${machine_type}}" >> $GITHUB_OUTPUT
   else
     # pool_action == reuse-running: VM is already up and gh_ready should already be 1.
     echo "label=${VM_ID}" >> $GITHUB_OUTPUT
     echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
+    echo "machine_type=${existing_machine_type}" >> $GITHUB_OUTPUT
   fi
 
   safety_off
+  recreated_once="false"
+  while :; do
   runner_online="false"
   gh_api_failures=0
+  i=0
   while (( i++ < 60 )); do
     GH_READY=$(gcloud compute instances describe ${VM_ID} --zone=${machine_zone} --format='json(labels)' | jq -r .labels.gh_ready)
     if [[ $GH_READY == 1 ]]; then
@@ -688,15 +921,46 @@ function start_vm {
   done
   if [[ "${runner_online}" == "true" ]]; then
     echo "✅ ${VM_ID} ready and online on GitHub ..."
-  else
-    # Deliberately always deletes here, even for a pooled VM (vm_teardown_action would say
-    # "stop") -- a VM that never came online is presumed to have some form of corrupted state
-    # (bad disk, broken registration, etc.), so we discard it rather than leave it stopped to
-    # fail the exact same way on every future resume.
-    echo "Waited 5 minutes for ${VM_ID} to come online, without luck, deleting ${VM_ID} ..."
-    gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}
-    exit 1
+    break
   fi
+
+  if [[ "${pool_action}" != "create" && "${recreated_once}" == "false" ]]; then
+    # A REUSED pooled VM (resumed or reused-running) that never came online is presumed stale,
+    # wedged, or caught mid-deletion -- the reuse decision was made from a snapshot that may
+    # have lied (see the in-flight-delete check at lookup time). A fresh create is a genuinely
+    # different attempt, so make it once instead of failing the whole run. A VM we CREATED this
+    # run failing to come online is a different story (likely image/config, retrying wastes
+    # 5 more minutes) and still fails below.
+    echo "⚠️ Reused pooled VM ${VM_ID} never came online; deleting it and creating a fresh replacement (one retry) ..." >&2
+    recreated_once="true"
+    safety_on
+    # The reuse-running path never fetched a registration token (an already-running VM doesn't
+    # need one) -- but the fresh create below does: build_startup_script interpolates
+    # ${RUNNER_TOKEN}, which would crash under nounset if left unset.
+    if [[ -z "${RUNNER_TOKEN:-}" ]]; then
+      fetch_runner_registration_token
+    fi
+    delete_pooled_vm_and_wait_gone
+    pool_action="create"
+    create_fresh_vm
+    # Re-emit outputs: the label (VM name) is deterministic and unchanged, but type/zone
+    # fallback in create_fresh_vm may have landed the replacement on a different combo. Last
+    # write wins in GITHUB_OUTPUT.
+    echo "label=${VM_ID}" >> $GITHUB_OUTPUT
+    echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
+    echo "machine_type=${machine_type}" >> $GITHUB_OUTPUT
+    safety_off
+    continue
+  fi
+
+  # Deliberately always deletes here, even for a pooled VM (vm_teardown_action would say
+  # "stop") -- a VM that never came online is presumed to have some form of corrupted state
+  # (bad disk, broken registration, etc.), so we discard it rather than leave it stopped to
+  # fail the exact same way on every future resume.
+  echo "Waited 5 minutes for ${VM_ID} to come online, without luck, deleting ${VM_ID} ..."
+  gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}
+  exit 1
+  done
 }
 
 function stop_vm {
@@ -815,10 +1079,9 @@ function delete_vm {
   # and GCE instance names are unique per-zone, not per-project, so checking only machine_zone
   # risks a false "doesn't exist" and leaving the real VM (and its cost) running indefinitely.
   zones_to_try=("${machine_zone}")
-  if [[ -n "${machine_zones}" ]]; then
-    IFS=',' read -ra fallback_zone_list <<< "${machine_zones}"
-    zones_to_try+=("${fallback_zone_list[@]}")
-  fi
+  while IFS= read -r csv_entry; do
+    zones_to_try+=("${csv_entry}")
+  done < <(split_csv "${machine_zones}")
 
   found_zone=""
   for candidate_zone in "${zones_to_try[@]}"; do

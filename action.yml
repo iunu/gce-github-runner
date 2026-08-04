@@ -14,6 +14,12 @@ inputs:
   token:
     description: >-
       GitHub auth token, needs `repo`/`public_repo` scope: https://docs.github.com/en/rest/reference/actions#self-hosted-runners.
+      NOTE: on preemptible VMs this token is also baked into the VM's startup-script metadata
+      (readable by any process on the VM -- the same trust domain that runs your workflow code)
+      so the on-VM preemption watcher can cancel the active workflow run and, for ephemeral
+      runners, deregister the runner the moment GCE announces preemption. Non-preemptible VMs
+      never receive the token. Prefer a PAT you can rotate easily. See README "Preemption
+      behavior".
     required: true
   project_id:
     description: >-
@@ -52,6 +58,23 @@ inputs:
     description: GCE machine type; https://cloud.google.com/compute/docs/machine-types
     default: "n1-standard-4"
     required: true
+  machine_types:
+    description: >-
+      Optional comma-separated list of fallback machine types to try, in order, when
+      `machine_type` is out of capacity. Search is type-major: each type is tried across ALL
+      zones (`machine_zone` + `machine_zones`) before degrading to the next type. A type not
+      offered in some zone is skipped, not fatal. For a pooled (`reuse_key`) VM that can't
+      resume due to stockout, these types are also tried IN PLACE via set-machine-type on the
+      stopped instance -- preserving the warm disk -- before falling back to delete+recreate.
+      COMPATIBILITY IS YOUR RESPONSIBILITY (the action degrades gracefully but can't validate):
+      all fallbacks must share the CPU architecture of `machine_type`/your image (never mix
+      x86 and ARM -- the installed runner binary and everything on disk is arch-specific),
+      must support the same boot-disk interface as `boot_disk_type`/the pooled VM's existing
+      disk (hyperdisk-only series can't attach pd-* disks), and must satisfy any
+      `accelerator`/`min_cpu_platform` constraints. Leave unset (default) to keep today's
+      behavior: only `machine_type` is tried.
+    default: ""
+    required: false
   disk_size:
     description: VM disk size.
     required: false
@@ -74,11 +97,14 @@ inputs:
     required: false
   runner_service_account:
     description: >-
-      Service account of the VM, defaults to default compute service account. This account
-      must have compute.instances.delete and compute.instances.stop permission on itself -- the
-      VM's self-teardown logic (job-completion hook, safety-net reaper, and the shutdown-script
-      that handles preemption) explicitly runs as this account, overriding any other identity a
-      job step running on the VM may have separately authenticated as in the meantime.
+      Service account of the VM, defaults to default compute service account. For ephemeral
+      (delete-mode) runners this account must have compute.instances.delete permission on
+      itself -- the VM's self-teardown logic (job-completion hook and safety-net reaper)
+      explicitly runs as this account, overriding any other identity a job step may have
+      separately authenticated as in the meantime; if the permission is missing, the VM powers
+      itself off instead (a TERMINATED leftover with disk cost, rather than a running zombie).
+      Pooled (`reuse_key`) runners need NO compute permissions: they idle-stop via a plain
+      guest-initiated poweroff, which lands the VM in TERMINATED exactly like an API stop.
     required: false
   image_project:
     description: >
@@ -92,7 +118,17 @@ inputs:
     description: The image family for the operating system that the boot disk will be initialized with.
     required: false
   preemptible:
-    description: Use GCE preemptible VM instance; https://cloud.google.com/compute/docs/instances/preemptible
+    description: >-
+      Use a preemptible/Spot VM (implemented as `--provisioning-model=SPOT`, the successor to
+      legacy preemptible -- same discounts and preemption mechanics, no 24h forced-stop cap);
+      https://cloud.google.com/compute/docs/instances/spot. On preemption, GCE itself deletes an
+      ephemeral (non-`reuse_key`, or `reuse_key`+`ephemeral`) VM server-side so it can never
+      linger as a zombie TERMINATED instance, and stops (preserves) a pooled persistent VM. In
+      both cases an on-VM preemption watcher cancels the active workflow run via the GitHub API
+      the moment GCE announces preemption (and additionally deregisters ephemeral runners), so
+      the job terminates within seconds instead of hanging until GitHub's ~10-minute
+      lost-communication timeout -- see the `token` input's note about the token this places on
+      the VM, and README "Preemption behavior".
     default: false
     required: true
   ephemeral:
@@ -168,6 +204,12 @@ outputs:
       The zone the VM actually landed in (may differ from the `machine_zone` input if
       `machine_zones` fallback was used).
     value: ${{ steps.gce-github-runner-script.outputs.zone }}
+  machine_type:
+    description: >-
+      The machine type the VM is actually running as (may differ from the `machine_type` input
+      if `machine_types` fallback was used at create time, via in-place rescue of a pooled VM,
+      or on a pooled VM created with a fallback type in a previous run).
+    value: ${{ steps.gce-github-runner-script.outputs.machine_type }}
 runs:
   using: "composite"
   steps:
@@ -182,6 +224,7 @@ runs:
         --machine_zone=${{ inputs.machine_zone }}
         --machine_zones='${{ inputs.machine_zones }}'
         --machine_type=${{ inputs.machine_type }}
+        --machine_types='${{ inputs.machine_types }}'
         --network=${{ inputs.network }}
         --subnet=${{ inputs.subnet }}
         --accelerator=${{ inputs.accelerator }}

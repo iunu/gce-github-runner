@@ -198,7 +198,18 @@ jobs:
 
 **2. Stop when idle** — nothing changes here: whichever `command: stop` pattern you use above
 automatically **stops** rather than deletes a pooled VM, since that behavior is baked into the VM
-at creation time.
+at creation time. The stop is a plain guest-initiated poweroff (which lands the VM in TERMINATED
+exactly like an API stop, disk intact), so pooled runners need **no compute IAM permissions at
+all** on their service account — only ephemeral runners' self-*delete* needs
+`compute.instances.delete`.
+
+**Self-healing**: manually deleting a pooled VM (e.g. to force it to pick up new runner/image
+changes on the next run) is safe, even mid-cycle. The `start` lookup detects an in-flight delete
+operation before trusting a `RUNNING` status (a deleting VM still *describes* as running for
+tens of seconds, with stale-but-passing readiness signals), waits it out, and creates fresh; a
+pooled VM that can't be resumed for any reason (stockout, mid-deletion, wedged) is deleted and
+recreated; and a reused VM that never comes online gets one delete-and-recreate retry before the
+run fails.
 
 **3. Reclaim it eventually** — a stopped pooled VM is never deleted on its own, so wire a
 `command: delete` step to your own PR-closed (or branch-deleted) trigger, using the **same
@@ -320,6 +331,82 @@ The VM may land in a different zone than the `machine_zone` input if fallback wa
 If you're using `reuse_key` together with `machine_zones`, see the note in
 [Pooled / reusable runners](#pooled--reusable-runners) about passing the same `machine_zones`
 value consistently to `delete` as well.
+
+## Machine-type fallback
+
+Zones aren't the only fallback dimension: `machine_types` takes an ordered, comma-separated list
+of alternative machine types to try when capacity runs out:
+
+```yaml
+          machine_type: 'c2d-highcpu-16'
+          machine_types: 'n2d-highcpu-16,c2-standard-16'
+```
+
+The search is **type-major**: each type is tried across *all* zones (`machine_zone` +
+`machine_zones`) before degrading to the next type — you'd rather have your preferred machine
+type in a fallback zone than a weaker type in your preferred zone. A type that simply isn't
+offered in some zone is skipped, not fatal; any non-capacity error (bad image, quota, auth)
+still fails immediately without walking the rest of the matrix.
+
+**Pooled runners get an extra rescue**: when a stopped pooled VM can't resume because its type
+is stocked out in its zone, the action changes the machine type **in place**
+(`set-machine-type` on the stopped instance) and starts it — a different type draws on a
+different capacity pool, and unlike delete-and-recreate this **preserves the warm disk**, which
+is the whole point of pool mode. Only if every candidate type fails does it fall back to
+delete-and-recreate (which then walks the full type×zone matrix).
+
+The `machine_type` output always reflects what the VM is actually running as, alongside `zone`:
+
+```yaml
+    outputs:
+      label: ${{ steps.create-runner.outputs.label }}
+      zone: ${{ steps.create-runner.outputs.zone }}
+      machine_type: ${{ steps.create-runner.outputs.machine_type }}
+```
+
+**⚠️ Compatibility is your responsibility.** The action degrades gracefully when a fallback
+type turns out to be incompatible (skipped combo at create; skipped rescue candidate, then
+delete+recreate), but it cannot validate your list up front. Every fallback type must:
+
+* **share the CPU architecture** of your image and primary type — never mix x86 and ARM; the
+  installed runner binary and everything on the disk is architecture-specific;
+* **support the same boot-disk interface** as `boot_disk_type` (and, for pooled rescue, the
+  existing VM's disk) — newer hyperdisk-only series can't attach `pd-*` disks and vice versa;
+* **satisfy any `accelerator` / `min_cpu_platform` constraints** you've configured (e.g.
+  accelerator-optimized families have fixed GPU pairings).
+
+## Preemption behavior
+
+`preemptible: true` creates a Spot VM (`--provisioning-model=SPOT` — the successor to legacy
+preemptible: same discounts, same preemption mechanics, no 24h forced-stop cap). When GCE
+preempts a runner mid-job:
+
+* **The workflow run is cancelled within seconds.** A preemption watcher on the VM long-polls
+  the metadata server's `instance/preempted` endpoint, which GCE flips at the very start of the
+  preemption notice — while the network is still fully up. The watcher cancels the active
+  workflow run via the GitHub API (deterministic and server-side, no dependence on the dying
+  VM's teardown races), then also stops the runner service as a fallback signal. Without this,
+  a preempted job just spins until GitHub's ~10-minute lost-communication timeout. This applies
+  to ephemeral and pooled runners alike. The watcher always cancels the run whose job is
+  actually executing on the VM — the job-started hook records the current run id on every job,
+  so a pooled VM serving many runs cancels the right one.
+* **Ephemeral VMs are deleted by GCE itself** (`--instance-termination-action=DELETE`), entirely
+  server-side — a preempted ephemeral runner can never linger as a zombie TERMINATED instance,
+  even if the guest gets no shutdown window at all. The watcher also deregisters the runner from
+  GitHub (ephemeral registrations can never be reused; GitHub's own auto-purge of offline
+  ephemeral runners after 1 day serves as the backstop if the window closes first).
+* **Pooled persistent VMs are stopped, not deleted** (`--instance-termination-action=STOP`) —
+  disk state survives, the runner registration is deliberately left intact, and the next `start`
+  with the same `reuse_key` resumes the VM and reconnects the same runner.
+
+**Security trade-off**: to make the API cancellation possible, the `token` input is baked into a
+preemptible VM's startup-script metadata, which is readable by any process on the VM — the same
+trust domain that already runs your workflow code. Non-preemptible VMs never receive the token.
+Use a PAT you can rotate easily, scoped as tightly as your setup allows.
+
+Note the run interrupted by preemption ends **cancelled**, not failed — these mechanics guarantee
+prompt termination and clean resource teardown, not retry. Pair with `machine_zones` (above) so
+the retry run can land somewhere with capacity.
 
 ## Example Workflows
 

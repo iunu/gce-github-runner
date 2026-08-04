@@ -332,6 +332,49 @@ If you're using `reuse_key` together with `machine_zones`, see the note in
 [Pooled / reusable runners](#pooled--reusable-runners) about passing the same `machine_zones`
 value consistently to `delete` as well.
 
+## Machine-type fallback
+
+Zones aren't the only fallback dimension: `machine_types` takes an ordered, comma-separated list
+of alternative machine types to try when capacity runs out:
+
+```yaml
+          machine_type: 'c2d-highcpu-16'
+          machine_types: 'n2d-highcpu-16,c2-standard-16'
+```
+
+The search is **type-major**: each type is tried across *all* zones (`machine_zone` +
+`machine_zones`) before degrading to the next type — you'd rather have your preferred machine
+type in a fallback zone than a weaker type in your preferred zone. A type that simply isn't
+offered in some zone is skipped, not fatal; any non-capacity error (bad image, quota, auth)
+still fails immediately without walking the rest of the matrix.
+
+**Pooled runners get an extra rescue**: when a stopped pooled VM can't resume because its type
+is stocked out in its zone, the action changes the machine type **in place**
+(`set-machine-type` on the stopped instance) and starts it — a different type draws on a
+different capacity pool, and unlike delete-and-recreate this **preserves the warm disk**, which
+is the whole point of pool mode. Only if every candidate type fails does it fall back to
+delete-and-recreate (which then walks the full type×zone matrix).
+
+The `machine_type` output always reflects what the VM is actually running as, alongside `zone`:
+
+```yaml
+    outputs:
+      label: ${{ steps.create-runner.outputs.label }}
+      zone: ${{ steps.create-runner.outputs.zone }}
+      machine_type: ${{ steps.create-runner.outputs.machine_type }}
+```
+
+**⚠️ Compatibility is your responsibility.** The action degrades gracefully when a fallback
+type turns out to be incompatible (skipped combo at create; skipped rescue candidate, then
+delete+recreate), but it cannot validate your list up front. Every fallback type must:
+
+* **share the CPU architecture** of your image and primary type — never mix x86 and ARM; the
+  installed runner binary and everything on the disk is architecture-specific;
+* **support the same boot-disk interface** as `boot_disk_type` (and, for pooled rescue, the
+  existing VM's disk) — newer hyperdisk-only series can't attach `pd-*` disks and vice versa;
+* **satisfy any `accelerator` / `min_cpu_platform` constraints** you've configured (e.g.
+  accelerator-optimized families have fixed GPU pairings).
+
 ## Preemption behavior
 
 `preemptible: true` creates a Spot VM (`--provisioning-model=SPOT` — the successor to legacy

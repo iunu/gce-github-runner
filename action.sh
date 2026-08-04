@@ -24,6 +24,7 @@ runner_ver=
 machine_zone=
 machine_zones=
 machine_type=
+machine_types=
 boot_disk_type=
 disk_size=
 runner_service_account=
@@ -56,6 +57,7 @@ while getopts_long :h opt \
   machine_zone required_argument \
   machine_zones optional_argument \
   machine_type required_argument \
+  machine_types optional_argument \
   boot_disk_type optional_argument \
   disk_size optional_argument \
   runner_service_account optional_argument \
@@ -103,6 +105,9 @@ do
       ;;
     machine_type)
       machine_type=$OPTLARG
+      ;;
+    machine_types)
+      machine_types=${OPTLARG-$machine_types}
       ;;
     boot_disk_type)
       boot_disk_type=${OPTLARG-$boot_disk_type}
@@ -505,6 +510,16 @@ function start_vm {
     zones_to_try+=("${fallback_zone_list[@]}")
   fi
 
+  # types_to_try: machine_type first, then any machine_types fallbacks, in order. Shared by
+  # create_fresh_vm (type-major search: each type is tried across ALL zones before degrading to
+  # the next type -- zones within a region are near-interchangeable, while machine type actually
+  # changes build performance/cost) and by the pooled resume rescue (in-place set-machine-type).
+  types_to_try=("${machine_type}")
+  if [[ -n "${machine_types}" ]]; then
+    IFS=',' read -ra fallback_type_list <<< "${machine_types}"
+    types_to_try+=("${fallback_type_list[@]}")
+  fi
+
   # Bounded wait until GCE stops returning the pooled VM at all (describe 404s). Used after
   # issuing/observing a delete, so an immediate re-create can't collide with the name while the
   # deletion is still completing server-side.
@@ -544,13 +559,18 @@ function start_vm {
   if [[ -n "${reuse_key}" ]]; then
     for candidate_zone in "${zones_to_try[@]}"; do
       set +o errexit
-      describe_output=$(gcloud compute instances describe "${VM_ID}" --zone="${candidate_zone}" --format='value(status)' 2>&1)
+      describe_output=$(gcloud compute instances describe "${VM_ID}" --zone="${candidate_zone}" --format='value(status,machineType)' 2>&1)
       describe_rc=$?
       set -o errexit
 
       if [[ ${describe_rc} -eq 0 ]]; then
         machine_zone="${candidate_zone}"
-        existing_status="${describe_output}"
+        # Two tab-separated fields: status, machineType URL (basename is the type name). The
+        # type feeds the machine_type output and lets the resume rescue skip re-trying the type
+        # the VM already has. Tolerate a missing second field (old mocks/edge responses).
+        read -r existing_status existing_machine_type_url <<< "${describe_output}"
+        existing_machine_type="${existing_machine_type_url##*/}"
+        existing_machine_type="${existing_machine_type:-unknown}"
 
         # A VM mid-deletion still describes as RUNNING for tens of seconds -- and its stale
         # gh_ready=1 label plus GitHub's lagging "online" runner status can pass every readiness
@@ -678,18 +698,23 @@ function start_vm {
     echo -n "${in}"
   }
 
-  # Creates a brand-new VM, trying each zone in $zones_to_try in order on a capacity stockout
-  # (ZONE_RESOURCE_POOL_EXHAUSTED). Non-stockout errors fail immediately, no further zones tried.
-  # Sets $machine_zone as a side effect to whichever zone actually succeeded. Called both for a
-  # genuine first-time create, and as a fallback when resuming an existing pooled VM turns out to
-  # be impossible because its home zone is itself stocked out (see pool_action == "start" below).
+  # Creates a brand-new VM, walking the type x zone matrix on capacity stockouts
+  # (ZONE_RESOURCE_POOL_EXHAUSTED): type-major order -- each machine type in $types_to_try is
+  # tried across ALL zones in $zones_to_try before degrading to the next type. A combo is also
+  # skipped when the type simply isn't offered in that zone ("machineTypes/... was not found");
+  # any other error fails immediately with no further combos, so real misconfiguration stays
+  # loud. Sets $machine_zone and $machine_type as side effects to whichever combo succeeded.
+  # Called for a genuine first-time create, and as the fallback when a pooled VM can't be
+  # resumed or rescued (see pool_action == "start" below).
   function create_fresh_vm {
-    local gh_repo_owner gh_repo gh_run_id candidate_zone create_output create_rc
+    local gh_repo_owner gh_repo gh_run_id candidate_zone candidate_type create_output create_rc
     gh_repo_owner="$(truncate_to_label "${GITHUB_REPOSITORY_OWNER}")"
     gh_repo="$(truncate_to_label "${GITHUB_REPOSITORY##*/}")"
     gh_run_id="${GITHUB_RUN_ID}"
 
     create_succeeded="false"
+    for candidate_type in "${types_to_try[@]}"; do
+    machine_type="${candidate_type}"
     for candidate_zone in "${zones_to_try[@]}"; do
       machine_zone="${candidate_zone}"
       build_startup_script
@@ -727,18 +752,22 @@ function start_vm {
       if [[ ${create_rc} -eq 0 ]]; then
         echo "${create_output}"
         create_succeeded="true"
-        break
+        break 2
       elif grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${create_output}"; then
-        echo "⚠️ Zone ${candidate_zone} appears to be out of capacity (stockout); trying next zone if available." >&2
+        echo "⚠️ ${candidate_type} in ${candidate_zone} is out of capacity (stockout); trying the next type/zone combo if available." >&2
+        echo "${create_output}" >&2
+      elif grep -qi "machineTypes/${candidate_type}' was not found" <<< "${create_output}"; then
+        echo "⚠️ ${candidate_type} is not offered in ${candidate_zone}; trying the next type/zone combo if available." >&2
         echo "${create_output}" >&2
       else
         echo "${create_output}" >&2
         exit 1
       fi
     done
+    done
 
     if [[ "${create_succeeded}" != "true" ]]; then
-      echo "❌ All candidate zones (${zones_to_try[*]}) are out of capacity." >&2
+      echo "❌ All machine type / zone combinations (types: ${types_to_try[*]}; zones: ${zones_to_try[*]}) are out of capacity or unavailable." >&2
       exit 1
     fi
   }
@@ -768,31 +797,66 @@ function start_vm {
 
       if [[ ${start_rc} -eq 0 ]]; then
         echo "${start_output}"
+        effective_machine_type="${existing_machine_type}"
       else
-        # ANY resume failure falls back to delete-and-recreate-fresh, not just stockout: unlike
-        # the create path (where a failure usually means caller misconfiguration that must fail
+        # ANY resume failure ends in delete-and-recreate-fresh, not just stockout: unlike the
+        # create path (where a failure usually means caller misconfiguration that must fail
         # loudly), a failed START of a VM that verifiably exists means THIS VM can't serve --
         # its zone is out of capacity, it's mid-deletion (a deleting VM still describes as
-        # existing for a while), stuck in a transitional state, or otherwise wedged. Recreating
-        # sacrifices the warm start but rescues the run; genuine misconfiguration still fails
-        # loudly inside create_fresh_vm.
+        # existing for a while), stuck in a transitional state, or otherwise wedged.
+        #
+        # But a STOCKOUT specifically gets one better option first: change the machine type IN
+        # PLACE (set-machine-type is valid on a TERMINATED instance) and start again -- a
+        # different type draws on a different capacity pool in the same zone, and unlike
+        # delete-and-recreate it keeps the warm disk, which is the whole point of pool mode.
+        # Rescue failures are soft (incompatible fallback type, or that pool is dry too):
+        # just try the next candidate; delete+recreate remains the backstop, and genuine
+        # misconfiguration still fails loudly inside create_fresh_vm.
+        rescued="false"
         if grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${start_output}"; then
-          echo "⚠️ Zone ${machine_zone} is out of capacity to resume pooled VM ${VM_ID} (stockout); deleting it and creating fresh in a fallback zone (pool warm-start lost for this run)." >&2
+          echo "⚠️ ${existing_machine_type} is out of capacity in ${machine_zone} to resume pooled VM ${VM_ID} (stockout); attempting in-place machine-type rescue before recreating." >&2
+          echo "${start_output}" >&2
+          for candidate_type in "${types_to_try[@]}"; do
+            if [[ "${candidate_type}" == "${existing_machine_type}" ]]; then
+              continue
+            fi
+            echo "Rescue attempt: switching ${VM_ID} to ${candidate_type} in place (warm disk preserved) ..."
+            set +o errexit
+            rescue_output=$( (gcloud compute instances set-machine-type ${VM_ID} --zone=${machine_zone} --machine-type=${candidate_type} && \
+              gcloud compute instances start ${VM_ID} --zone=${machine_zone}) 2>&1)
+            rescue_rc=$?
+            set -o errexit
+            if [[ ${rescue_rc} -eq 0 ]]; then
+              echo "${rescue_output}"
+              echo "✅ Rescued pooled VM ${VM_ID} in place as ${candidate_type} (warm start preserved)."
+              effective_machine_type="${candidate_type}"
+              rescued="true"
+              break
+            fi
+            echo "⚠️ Rescue as ${candidate_type} failed (incompatible type, or its capacity pool is dry too); trying the next candidate if available." >&2
+            echo "${rescue_output}" >&2
+          done
         else
           echo "⚠️ Could not resume pooled VM ${VM_ID} in ${machine_zone} (mid-deletion, transitional state, or wedged); deleting it and creating fresh (pool warm-start lost for this run)." >&2
+          echo "${start_output}" >&2
         fi
-        echo "${start_output}" >&2
-        delete_pooled_vm_and_wait_gone
-        pool_action="create"
-        create_fresh_vm
+
+        if [[ "${rescued}" != "true" ]]; then
+          delete_pooled_vm_and_wait_gone
+          pool_action="create"
+          create_fresh_vm
+          effective_machine_type="${machine_type}"
+        fi
       fi
     fi
     echo "label=${VM_ID}" >> $GITHUB_OUTPUT
     echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
+    echo "machine_type=${effective_machine_type:-${machine_type}}" >> $GITHUB_OUTPUT
   else
     # pool_action == reuse-running: VM is already up and gh_ready should already be 1.
     echo "label=${VM_ID}" >> $GITHUB_OUTPUT
     echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
+    echo "machine_type=${existing_machine_type}" >> $GITHUB_OUTPUT
   fi
 
   safety_off
@@ -864,10 +928,12 @@ function start_vm {
     delete_pooled_vm_and_wait_gone
     pool_action="create"
     create_fresh_vm
-    # Re-emit outputs: the label (VM name) is deterministic and unchanged, but zone fallback in
-    # create_fresh_vm may have landed the replacement elsewhere. Last write wins in GITHUB_OUTPUT.
+    # Re-emit outputs: the label (VM name) is deterministic and unchanged, but type/zone
+    # fallback in create_fresh_vm may have landed the replacement on a different combo. Last
+    # write wins in GITHUB_OUTPUT.
     echo "label=${VM_ID}" >> $GITHUB_OUTPUT
     echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
+    echo "machine_type=${machine_type}" >> $GITHUB_OUTPUT
     safety_off
     continue
   fi

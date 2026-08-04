@@ -321,6 +321,30 @@ If you're using `reuse_key` together with `machine_zones`, see the note in
 [Pooled / reusable runners](#pooled--reusable-runners) about passing the same `machine_zones`
 value consistently to `delete` as well.
 
+## Preemption behavior
+
+`preemptible: true` creates a Spot VM (`--provisioning-model=SPOT` — the successor to legacy
+preemptible: same discounts, same preemption mechanics, no 24h forced-stop cap). When GCE
+preempts a runner mid-job:
+
+* **The job fails fast.** The VM's shutdown-script gracefully stops the runner service inside
+  the ~30-second preemption window, so the runner tells GitHub it's going away and the job fails
+  within seconds with "The runner has received a shutdown signal" — instead of hanging ~10
+  minutes until GitHub's lost-communication timeout. This applies to ephemeral and pooled
+  runners alike.
+* **Ephemeral VMs are deleted by GCE itself** (`--instance-termination-action=DELETE`), entirely
+  server-side — a preempted ephemeral runner can never linger as a zombie TERMINATED instance,
+  even if the guest gets no shutdown window at all. Its GitHub runner registration is not
+  removed at preemption time (doing so would require baking a token into the VM); GitHub
+  auto-purges offline ephemeral registrations after 1 day.
+* **Pooled persistent VMs are stopped, not deleted** (`--instance-termination-action=STOP`) —
+  disk state survives, the registration stays valid, and the next `start` with the same
+  `reuse_key` resumes the VM and reconnects the same runner.
+
+Preemption still fails the workflow run that was interrupted — these mechanics only guarantee
+prompt failure and clean resource teardown, not retry. Pair with `machine_zones` (above) so the
+retry run can land somewhere with capacity.
+
 ## Example Workflows
 
 * [Test Workflow](./.github/workflows/test.yml): Test workflow.

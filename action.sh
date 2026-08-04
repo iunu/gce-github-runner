@@ -342,22 +342,34 @@ function build_startup_script {
 
   # GCE shutdown-script: a metadata key distinct from startup-script, invoked by the guest agent
   # best-effort on ANY VM shutdown -- including preemption (GCE docs: ACPI G2 soft-off, ~30s
-  # window). This is the only teardown mechanism that can plausibly catch preemption: the
+  # window). This is the only in-guest mechanism that can react to preemption at all: the
   # job-completion runner hook and the in-guest reaper (both above) are themselves killed along
   # with the guest OS the instant the host reclaims the VM, so neither ever gets a chance to run.
   #
-  # Only ever set when vm_teardown_action=="delete" -- a plain ephemeral run, or a pooled+
-  # ephemeral run (neither can ever be reused regardless of VM state, see start_vm). Deliberately
-  # NEVER set when vm_teardown_action=="stop" (a pooled, non-ephemeral VM): those are meant to
-  # persist across any stop, preemption included, so they must never carry a self-delete script.
-  # Delegates to shutdown.sh (see its own comment) rather than calling gcloud directly here too,
-  # so the service-account fix above only has to exist in one place.
-  if [[ "${vm_teardown_action}" == "delete" ]]; then
-    shutdown_script="#!/bin/sh
-/etc/systemd/system/shutdown.sh 0
+  # BOTH modes stop the runner service first: a gracefully-stopped runner tells GitHub it is
+  # going away, so an in-flight job fails within seconds ("The runner has received a shutdown
+  # signal") instead of hanging ~10 minutes until GitHub's lost-communication timeout. Stopping
+  # the service does NOT deregister anything -- .runner/.credentials stay on disk, which is
+  # exactly right: a pooled VM's registration must survive preemption (resume re-runs svc.sh
+  # start and reconnects), and an ephemeral VM's orphaned registration is auto-purged by GitHub
+  # after 1 day offline. The timeout guard keeps a wedged systemctl from eating the whole
+  # preemption window.
+  #
+  # Only delete-mode VMs (plain ephemeral, or pooled+ephemeral) additionally self-delete via
+  # shutdown.sh -- an in-guest backup to the server-side Spot termination action DELETE set at
+  # create time (see preemptible_flag in start_vm), which also catches a delete-mode VM stopped
+  # some way other than preemption (e.g. manually from the console). A pooled persistent VM's
+  # script must NEVER touch the VM itself -- its disk is the whole point of pool mode.
+  # This string is consumed directly by the guest agent (never re-written through a VM-side
+  # heredoc), so level-1 backslash-escapes are the only quoting it needs.
+  shutdown_script="#!/bin/sh
+preempted=\$(curl -S -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/preempted)
+echo \"shutdown-script: preempted=\${preempted}; stopping the runner service so any in-flight job fails fast.\"
+timeout 10 systemctl stop 'actions.runner.*' || true
 "
-  else
-    shutdown_script=""
+  if [[ "${vm_teardown_action}" == "delete" ]]; then
+    shutdown_script+="/etc/systemd/system/shutdown.sh 0
+"
   fi
 
   if $actions_preinstalled ; then
@@ -466,7 +478,18 @@ function start_vm {
   image_family_flag=$([[ -z "${image_family}" ]] || echo "--image-family=${image_family}")
   disk_size_flag=$([[ -z "${disk_size}" ]] || echo "--boot-disk-size=${disk_size}")
   boot_disk_type_flag=$([[ -z "${boot_disk_type}" ]] || echo "--boot-disk-type=${boot_disk_type}")
-  preemptible_flag=$([[ "${preemptible}" == "true" ]] && echo "--preemptible" || echo "")
+  # preemptible=true is implemented as Spot provisioning (same discount/preemption model as
+  # legacy --preemptible, minus its 24h forced-stop cap) because Spot unlocks
+  # --instance-termination-action: on preemption GCE ITSELF deletes a delete-mode VM (plain
+  # ephemeral, or pooled+ephemeral) server-side -- no reliance on the guest winning its ~30s
+  # best-effort shutdown window -- so a preempted ephemeral runner can never linger as a zombie
+  # TERMINATED instance. Pooled persistent VMs keep stop-on-preemption (their disk must survive).
+  if [[ "${preemptible}" == "true" ]]; then
+    spot_termination_action=$([[ "${vm_teardown_action}" == "delete" ]] && echo "DELETE" || echo "STOP")
+    preemptible_flag="--provisioning-model=SPOT --instance-termination-action=${spot_termination_action}"
+  else
+    preemptible_flag=""
+  fi
   ephemeral_flag=$([[ "${ephemeral}" == "true" ]] && echo "--ephemeral" || echo "")
   no_external_address_flag=$([[ "${no_external_address}" == "true" ]] && echo "--no-address" || echo "")
   network_flag=$([[ ! -z "${network}"  ]] && echo "--network=${network}" || echo "")
@@ -474,9 +497,10 @@ function start_vm {
   accelerator=$([[ ! -z "${accelerator}"  ]] && echo "--accelerator=${accelerator} --maintenance-policy=TERMINATE" || echo "")
   maintenance_policy_flag=$([[ -z "${maintenance_policy_terminate}"  ]] || echo "--maintenance-policy=TERMINATE" )
 
-  # Clamp deletion_timeout to real-world ceilings: GCE preemptible VMs are hard-terminated
-  # by Google after 24h regardless of anything else, and GitHub Actions workflow runs are
-  # capped at 3 days in all cases.
+  # Clamp deletion_timeout to real-world ceilings: GitHub Actions workflow runs are capped at
+  # 3 days in all cases. The tighter 24h ceiling for preemptible=true dates from legacy
+  # preemptible VMs' hard 24h termination; Spot provisioning (what preemptible=true creates
+  # now) has no such cap, but 24h remains a sane upper bound for a CI runner's safety net.
   deletion_timeout_max=259200
   if [[ "${preemptible}" == "true" ]]; then
     deletion_timeout_max=86400
@@ -533,12 +557,9 @@ function start_vm {
       # One atomic --metadata argument carrying both scripts (the ^~~~^ custom-delimiter syntax
       # from `gcloud topic escaping` separates dict ITEMS, so a second key rides along in the
       # same flag). Setting shutdown-script in the create itself -- not a follow-up add-metadata
-      # call -- means there is no window where the VM exists but its preemption self-delete
+      # call -- means there is no window where the VM exists but its preemption handling
       # doesn't. Neither script may ever contain the literal sequence ~~~.
-      metadata_arg="--metadata=^~~~^startup-script=${startup_script}"
-      if [[ -n "${shutdown_script}" ]]; then
-        metadata_arg+="~~~shutdown-script=${shutdown_script}"
-      fi
+      metadata_arg="--metadata=^~~~^startup-script=${startup_script}~~~shutdown-script=${shutdown_script}"
 
       set +o errexit
       create_output=$(gcloud compute instances create ${VM_ID} \
@@ -592,29 +613,15 @@ function start_vm {
       # stopped.
       build_startup_script
 
-      # Same rationale/gating as create_fresh_vm -- this branch is only ever reached for a
-      # pooled VM (reuse_key set). Normally that means vm_teardown_action=="stop" (persist, no
-      # shutdown-script), but if this specific VM was previously pooled+ephemeral and got
-      # preempted before it could self-delete, it's still found here on resume with
-      # vm_teardown_action=="delete" -- so it must be re-armed with a shutdown-script too, the
-      # same as a fresh create, rather than assuming resume always means "persist".
-      #
-      # Conversely, when this resume wants NO shutdown-script, any existing one must be actively
-      # REMOVED, not merely left un-updated: if this VM's previous life was pooled+ephemeral it
-      # still carries a self-DELETE shutdown-script, and a persistent pooled VM resumed with that
-      # in place would delete itself the first time it was idle-stopped.
-      metadata_arg="--metadata=^~~~^startup-script=${startup_script}"
-      shutdown_script_cleanup="true"
-      if [[ -n "${shutdown_script}" ]]; then
-        metadata_arg+="~~~shutdown-script=${shutdown_script}"
-      else
-        shutdown_script_cleanup="gcloud compute instances remove-metadata ${VM_ID} --zone=${machine_zone} --keys=shutdown-script"
-      fi
+      # Same rationale as create_fresh_vm's metadata_arg. Every resume overwrites BOTH scripts
+      # with ones built for the current mode, which also self-heals a stale shutdown-script left
+      # by this VM's previous life (e.g. once pooled+ephemeral with a self-DELETE script, now
+      # resumed as a persistent pooled VM whose script must only stop the runner service).
+      metadata_arg="--metadata=^~~~^startup-script=${startup_script}~~~shutdown-script=${shutdown_script}"
 
       set +o errexit
       start_output=$( (gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \
         gcloud compute instances add-metadata ${VM_ID} --zone=${machine_zone} "${metadata_arg}" && \
-        ${shutdown_script_cleanup} && \
         gcloud compute instances start ${VM_ID} --zone=${machine_zone}) 2>&1)
       start_rc=$?
       set -o errexit

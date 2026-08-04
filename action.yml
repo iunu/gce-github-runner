@@ -92,7 +92,15 @@ inputs:
     description: The image family for the operating system that the boot disk will be initialized with.
     required: false
   preemptible:
-    description: Use GCE preemptible VM instance; https://cloud.google.com/compute/docs/instances/preemptible
+    description: >-
+      Use a preemptible/Spot VM (implemented as `--provisioning-model=SPOT`, the successor to
+      legacy preemptible -- same discounts and preemption mechanics, no 24h forced-stop cap);
+      https://cloud.google.com/compute/docs/instances/spot. On preemption, GCE itself deletes an
+      ephemeral (non-`reuse_key`, or `reuse_key`+`ephemeral`) VM server-side so it can never
+      linger as a zombie TERMINATED instance, and stops (preserves) a pooled persistent VM. In
+      both cases the VM's shutdown-script stops the runner service in the preemption window, so
+      an in-flight GitHub Actions job fails within seconds instead of hanging until GitHub's
+      ~10-minute lost-communication timeout.
     default: false
     required: true
   ephemeral:

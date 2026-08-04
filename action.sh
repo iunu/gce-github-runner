@@ -190,6 +190,23 @@ function gcloud_auth {
   echo "✅ Successfully configured gcloud."
 }
 
+# Splits a comma-separated list into one trimmed entry per line, dropping empty entries --
+# tolerating the whitespace and trailing commas users commonly write in YAML values (e.g.
+# "n2d-highcpu-16, c2-standard-16" or "us-central1-a,"). Without this, an entry like
+# " c2-standard-16" reaches an unquoted --machine-type=${...} expansion, word-splits into a
+# broken flag, and hard-fails the run looking like caller misconfiguration instead of being
+# tried as a fallback. Used for machine_zones (start_vm AND delete_vm) and machine_types.
+function split_csv {
+  local IFS=',' entry
+  for entry in $1; do
+    entry="${entry#"${entry%%[![:space:]]*}"}"   # ltrim
+    entry="${entry%"${entry##*[![:space:]]}"}"   # rtrim
+    if [[ -n "${entry}" ]]; then
+      echo "${entry}"
+    fi
+  done
+}
+
 # GCE instance names (unlike labels) must match ^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$ (<=63 chars,
 # no dots/underscores, must start with a letter). Used by both start_vm (pool mode) and delete_vm,
 # so it must be a top-level function -- delete_vm never calls start_vm.
@@ -505,20 +522,18 @@ function start_vm {
   # creating a second, identically-named VM in another zone -- both then racing to register the
   # same GitHub runner label.
   zones_to_try=("${machine_zone}")
-  if [[ -n "${machine_zones}" ]]; then
-    IFS=',' read -ra fallback_zone_list <<< "${machine_zones}"
-    zones_to_try+=("${fallback_zone_list[@]}")
-  fi
+  while IFS= read -r csv_entry; do
+    zones_to_try+=("${csv_entry}")
+  done < <(split_csv "${machine_zones}")
 
   # types_to_try: machine_type first, then any machine_types fallbacks, in order. Shared by
   # create_fresh_vm (type-major search: each type is tried across ALL zones before degrading to
   # the next type -- zones within a region are near-interchangeable, while machine type actually
   # changes build performance/cost) and by the pooled resume rescue (in-place set-machine-type).
   types_to_try=("${machine_type}")
-  if [[ -n "${machine_types}" ]]; then
-    IFS=',' read -ra fallback_type_list <<< "${machine_types}"
-    types_to_try+=("${fallback_type_list[@]}")
-  fi
+  while IFS= read -r csv_entry; do
+    types_to_try+=("${csv_entry}")
+  done < <(split_csv "${machine_types}")
 
   # Bounded wait until GCE stops returning the pooled VM at all (describe 404s). Used after
   # issuing/observing a delete, so an immediate re-create can't collide with the name while the
@@ -1064,10 +1079,9 @@ function delete_vm {
   # and GCE instance names are unique per-zone, not per-project, so checking only machine_zone
   # risks a false "doesn't exist" and leaving the real VM (and its cost) running indefinitely.
   zones_to_try=("${machine_zone}")
-  if [[ -n "${machine_zones}" ]]; then
-    IFS=',' read -ra fallback_zone_list <<< "${machine_zones}"
-    zones_to_try+=("${fallback_zone_list[@]}")
-  fi
+  while IFS= read -r csv_entry; do
+    zones_to_try+=("${csv_entry}")
+  done < <(split_csv "${machine_zones}")
 
   found_zone=""
   for candidate_zone in "${zones_to_try[@]}"; do

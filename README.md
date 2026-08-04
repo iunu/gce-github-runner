@@ -203,6 +203,14 @@ exactly like an API stop, disk intact), so pooled runners need **no compute IAM 
 all** on their service account — only ephemeral runners' self-*delete* needs
 `compute.instances.delete`.
 
+**Self-healing**: manually deleting a pooled VM (e.g. to force it to pick up new runner/image
+changes on the next run) is safe, even mid-cycle. The `start` lookup detects an in-flight delete
+operation before trusting a `RUNNING` status (a deleting VM still *describes* as running for
+tens of seconds, with stale-but-passing readiness signals), waits it out, and creates fresh; a
+pooled VM that can't be resumed for any reason (stockout, mid-deletion, wedged) is deleted and
+recreated; and a reused VM that never comes online gets one delete-and-recreate retry before the
+run fails.
+
 **3. Reclaim it eventually** — a stopped pooled VM is never deleted on its own, so wire a
 `command: delete` step to your own PR-closed (or branch-deleted) trigger, using the **same
 `reuse_key`, `machine_zone`, and (if used) `machine_zones`** that were used to create it (instance

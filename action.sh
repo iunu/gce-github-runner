@@ -505,6 +505,41 @@ function start_vm {
     zones_to_try+=("${fallback_zone_list[@]}")
   fi
 
+  # Bounded wait until GCE stops returning the pooled VM at all (describe 404s). Used after
+  # issuing/observing a delete, so an immediate re-create can't collide with the name while the
+  # deletion is still completing server-side.
+  function wait_pooled_vm_gone {
+    local waited=0 gone_output gone_rc
+    while (( waited < 120 )); do
+      set +o errexit
+      gone_output=$(gcloud compute instances describe "${VM_ID}" --zone="${machine_zone}" --format='value(status)' 2>&1)
+      gone_rc=$?
+      set -o errexit
+      if [[ ${gone_rc} -ne 0 ]] && grep -qi 'was not found' <<< "${gone_output}"; then
+        return 0
+      fi
+      sleep 5
+      waited=$((waited + 5))
+    done
+    echo "⚠️ ${VM_ID} is still visible in ${machine_zone} after ${waited}s; a follow-up create may fail with alreadyExists." >&2
+  }
+
+  # Best-effort delete of the pooled VM, then wait for it to be fully gone. Tolerates the VM
+  # already being deleted (or mid-deletion by someone else); any other delete error is reported
+  # but not fatal -- the follow-up create fails loudly anyway if the VM truly still exists.
+  function delete_pooled_vm_and_wait_gone {
+    local del_output del_rc
+    set +o errexit
+    del_output=$(gcloud --quiet compute instances delete "${VM_ID}" --zone="${machine_zone}" 2>&1)
+    del_rc=$?
+    set -o errexit
+    if [[ ${del_rc} -ne 0 ]] && ! grep -qi 'was not found' <<< "${del_output}"; then
+      echo "⚠️ Deleting ${VM_ID} reported an error (continuing; the follow-up create will surface it if real):" >&2
+      echo "${del_output}" >&2
+    fi
+    wait_pooled_vm_gone
+  }
+
   pool_action="create"
   if [[ -n "${reuse_key}" ]]; then
     for candidate_zone in "${zones_to_try[@]}"; do
@@ -516,6 +551,26 @@ function start_vm {
       if [[ ${describe_rc} -eq 0 ]]; then
         machine_zone="${candidate_zone}"
         existing_status="${describe_output}"
+
+        # A VM mid-deletion still describes as RUNNING for tens of seconds -- and its stale
+        # gh_ready=1 label plus GitHub's lagging "online" runner status can pass every readiness
+        # check below, handing the job to a VM that is actively vanishing (observed in the
+        # wild: pooled VM manually deleted, immediately re-run, action declared it ready).
+        # An in-flight delete OPERATION is visible from T+0 though, so check for one before
+        # trusting the status. Best-effort: if the operations lookup itself fails (e.g. the
+        # workflow SA lacks zoneOperations.list), fall through to the status-based decision.
+        set +o errexit
+        pending_delete=$(gcloud compute operations list --zones="${machine_zone}" \
+          --filter="targetLink ~ /instances/${VM_ID}\$ AND operationType=delete AND NOT status=DONE" \
+          --format='value(name)' 2>/dev/null | head -n1)
+        set -o errexit
+        if [[ -n "${pending_delete}" ]]; then
+          echo "⚠️ Pooled VM ${VM_ID} in ${machine_zone} has an in-flight delete operation (${pending_delete}); waiting for it to finish, then creating fresh." >&2
+          wait_pooled_vm_gone
+          pool_action="create"
+          break
+        fi
+
         if [[ "${existing_status}" == "RUNNING" ]]; then
           echo "✅ Pooled VM ${VM_ID} already RUNNING in ${machine_zone}; reusing as-is."
           pool_action="reuse-running"
@@ -539,16 +594,22 @@ function start_vm {
     fi
   fi
 
-  if [[ "${pool_action}" == "create" || "${pool_action}" == "start" ]]; then
-    # build_startup_script always interpolates ${RUNNER_TOKEN} while constructing the script text
-    # (even though the resulting `config.sh --token ${RUNNER_TOKEN}` line only actually executes
-    # on the VM if /actions-runner/.runner is missing) -- so it must be a valid, non-crashing
-    # value under `nounset` on both the "create" and "start" (resume) paths, not just "create".
+  function fetch_runner_registration_token {
     RUNNER_TOKEN=$(curl -S -s -XPOST \
         -H "authorization: Bearer ${token}" \
         https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners/registration-token |\
         jq -r .token)
     echo "✅ Successfully got the GitHub Runner registration token"
+  }
+
+  if [[ "${pool_action}" == "create" || "${pool_action}" == "start" ]]; then
+    # build_startup_script always interpolates ${RUNNER_TOKEN} while constructing the script text
+    # (even though the resulting `config.sh --token ${RUNNER_TOKEN}` line only actually executes
+    # on the VM if /actions-runner/.runner is missing) -- so it must be a valid, non-crashing
+    # value under `nounset` on both the "create" and "start" (resume) paths, not just "create".
+    # (The reuse-running path skips this; if its readiness poll later falls back to a fresh
+    # create, that path fetches the token itself before calling create_fresh_vm.)
+    fetch_runner_registration_token
   fi
 
   service_account_flag=$([[ -z "${runner_service_account}" ]] || echo "--service-account=${runner_service_account}")
@@ -707,19 +768,23 @@ function start_vm {
 
       if [[ ${start_rc} -eq 0 ]]; then
         echo "${start_output}"
-      elif grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${start_output}"; then
-        # The stopped VM's own zone is stocked out -- it can't be resumed there, and moving a
-        # disk across zones isn't a thing GCE supports in-place. Fall back to the same
-        # zone-fallback create used for a brand-new VM, sacrificing this run's warm start (the
-        # old VM/disk is deleted) in exchange for not just failing outright.
-        echo "⚠️ Zone ${machine_zone} is out of capacity to resume pooled VM ${VM_ID} (stockout); deleting it there and creating fresh in a fallback zone (pool warm-start lost for this run)." >&2
+      else
+        # ANY resume failure falls back to delete-and-recreate-fresh, not just stockout: unlike
+        # the create path (where a failure usually means caller misconfiguration that must fail
+        # loudly), a failed START of a VM that verifiably exists means THIS VM can't serve --
+        # its zone is out of capacity, it's mid-deletion (a deleting VM still describes as
+        # existing for a while), stuck in a transitional state, or otherwise wedged. Recreating
+        # sacrifices the warm start but rescues the run; genuine misconfiguration still fails
+        # loudly inside create_fresh_vm.
+        if grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available' <<< "${start_output}"; then
+          echo "⚠️ Zone ${machine_zone} is out of capacity to resume pooled VM ${VM_ID} (stockout); deleting it and creating fresh in a fallback zone (pool warm-start lost for this run)." >&2
+        else
+          echo "⚠️ Could not resume pooled VM ${VM_ID} in ${machine_zone} (mid-deletion, transitional state, or wedged); deleting it and creating fresh (pool warm-start lost for this run)." >&2
+        fi
         echo "${start_output}" >&2
-        gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}
+        delete_pooled_vm_and_wait_gone
         pool_action="create"
         create_fresh_vm
-      else
-        echo "${start_output}" >&2
-        exit 1
       fi
     fi
     echo "label=${VM_ID}" >> $GITHUB_OUTPUT
@@ -731,8 +796,11 @@ function start_vm {
   fi
 
   safety_off
+  recreated_once="false"
+  while :; do
   runner_online="false"
   gh_api_failures=0
+  i=0
   while (( i++ < 60 )); do
     GH_READY=$(gcloud compute instances describe ${VM_ID} --zone=${machine_zone} --format='json(labels)' | jq -r .labels.gh_ready)
     if [[ $GH_READY == 1 ]]; then
@@ -774,15 +842,44 @@ function start_vm {
   done
   if [[ "${runner_online}" == "true" ]]; then
     echo "✅ ${VM_ID} ready and online on GitHub ..."
-  else
-    # Deliberately always deletes here, even for a pooled VM (vm_teardown_action would say
-    # "stop") -- a VM that never came online is presumed to have some form of corrupted state
-    # (bad disk, broken registration, etc.), so we discard it rather than leave it stopped to
-    # fail the exact same way on every future resume.
-    echo "Waited 5 minutes for ${VM_ID} to come online, without luck, deleting ${VM_ID} ..."
-    gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}
-    exit 1
+    break
   fi
+
+  if [[ "${pool_action}" != "create" && "${recreated_once}" == "false" ]]; then
+    # A REUSED pooled VM (resumed or reused-running) that never came online is presumed stale,
+    # wedged, or caught mid-deletion -- the reuse decision was made from a snapshot that may
+    # have lied (see the in-flight-delete check at lookup time). A fresh create is a genuinely
+    # different attempt, so make it once instead of failing the whole run. A VM we CREATED this
+    # run failing to come online is a different story (likely image/config, retrying wastes
+    # 5 more minutes) and still fails below.
+    echo "⚠️ Reused pooled VM ${VM_ID} never came online; deleting it and creating a fresh replacement (one retry) ..." >&2
+    recreated_once="true"
+    safety_on
+    # The reuse-running path never fetched a registration token (an already-running VM doesn't
+    # need one) -- but the fresh create below does: build_startup_script interpolates
+    # ${RUNNER_TOKEN}, which would crash under nounset if left unset.
+    if [[ -z "${RUNNER_TOKEN:-}" ]]; then
+      fetch_runner_registration_token
+    fi
+    delete_pooled_vm_and_wait_gone
+    pool_action="create"
+    create_fresh_vm
+    # Re-emit outputs: the label (VM name) is deterministic and unchanged, but zone fallback in
+    # create_fresh_vm may have landed the replacement elsewhere. Last write wins in GITHUB_OUTPUT.
+    echo "label=${VM_ID}" >> $GITHUB_OUTPUT
+    echo "zone=${machine_zone}" >> $GITHUB_OUTPUT
+    safety_off
+    continue
+  fi
+
+  # Deliberately always deletes here, even for a pooled VM (vm_teardown_action would say
+  # "stop") -- a VM that never came online is presumed to have some form of corrupted state
+  # (bad disk, broken registration, etc.), so we discard it rather than leave it stopped to
+  # fail the exact same way on every future resume.
+  echo "Waited 5 minutes for ${VM_ID} to come online, without luck, deleting ${VM_ID} ..."
+  gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}
+  exit 1
+  done
 }
 
 function stop_vm {

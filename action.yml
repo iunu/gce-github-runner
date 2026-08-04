@@ -14,6 +14,12 @@ inputs:
   token:
     description: >-
       GitHub auth token, needs `repo`/`public_repo` scope: https://docs.github.com/en/rest/reference/actions#self-hosted-runners.
+      NOTE: on preemptible VMs this token is also baked into the VM's startup-script metadata
+      (readable by any process on the VM -- the same trust domain that runs your workflow code)
+      so the on-VM preemption watcher can cancel the active workflow run and, for ephemeral
+      runners, deregister the runner the moment GCE announces preemption. Non-preemptible VMs
+      never receive the token. Prefer a PAT you can rotate easily. See README "Preemption
+      behavior".
     required: true
   project_id:
     description: >-
@@ -98,9 +104,11 @@ inputs:
       https://cloud.google.com/compute/docs/instances/spot. On preemption, GCE itself deletes an
       ephemeral (non-`reuse_key`, or `reuse_key`+`ephemeral`) VM server-side so it can never
       linger as a zombie TERMINATED instance, and stops (preserves) a pooled persistent VM. In
-      both cases the VM's shutdown-script stops the runner service in the preemption window, so
-      an in-flight GitHub Actions job fails within seconds instead of hanging until GitHub's
-      ~10-minute lost-communication timeout.
+      both cases an on-VM preemption watcher cancels the active workflow run via the GitHub API
+      the moment GCE announces preemption (and additionally deregisters ephemeral runners), so
+      the job terminates within seconds instead of hanging until GitHub's ~10-minute
+      lost-communication timeout -- see the `token` input's note about the token this places on
+      the VM, and README "Preemption behavior".
     default: false
     required: true
   ephemeral:

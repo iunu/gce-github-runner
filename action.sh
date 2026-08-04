@@ -213,8 +213,9 @@ function compute_pool_vm_name {
 
 # Builds the GCE startup-script metadata value (sets $startup_script as a side effect). Reads
 # VM_ID, machine_zone, vm_teardown_action, shutdown_timeout, deletion_timeout, GITHUB_REPOSITORY,
-# RUNNER_TOKEN, ephemeral_flag, actions_preinstalled, runner_ver, arm, and pool_action (create vs
-# start/resume -- defaults to create if unset) from the enclosing scope.
+# GITHUB_RUN_ID, RUNNER_TOKEN, token, preemptible, ephemeral_flag, actions_preinstalled,
+# runner_ver, arm, and pool_action (create vs start/resume -- defaults to create if unset) from
+# the enclosing scope.
 # Safe to call more than once per start_vm invocation (e.g. once per zone-fallback attempt): the
 # "runner_ver=latest" resolution below mutates runner_ver to a concrete version on first call, so
 # the GitHub API lookup is automatically skipped on any later call.
@@ -263,6 +264,58 @@ function build_startup_script {
   sanitize_cmds=""
   if [[ "${pool_action:-create}" != "start" ]]; then
     sanitize_cmds="rm -f /actions-runner/.runner /actions-runner/.credentials /actions-runner/.credentials_rsaparams && \\
+	"
+  fi
+
+  # Preemption watcher: a tiny daemon (launched below like the reaper) that long-polls the
+  # metadata server's instance/preempted endpoint. GCE flips it to TRUE at the very START of the
+  # preemption sequence, so the watcher reacts with the network fully up and the whole ~30s
+  # window ahead of it -- unlike the shutdown-script, which races systemd's parallel teardown
+  # and empirically loses (the job then hangs ~10 minutes until GitHub's lost-communication
+  # timeout). On the notice it: (1) cancels the active workflow run via the GitHub API --
+  # deterministic, server-side, fails the job within seconds for BOTH ephemeral and pooled
+  # runners; (2) stops the runner service as a fallback signal; (3) on delete-mode VMs only,
+  # deregisters the runner (reading its agentId from the .runner file written at registration).
+  # Pooled persistent VMs never deregister -- their registration must survive to reconnect on
+  # resume. The run id to cancel comes from /actions-runner/.current-run-id, which the
+  # JOB_STARTED hook refreshes on every job (a pooled VM serves many runs; the create-time run
+  # id would go stale), falling back to the run id baked at create/resume time.
+  #
+  # SECURITY NOTE: this bakes the action's PAT (the token input) into the VM's startup-script
+  # metadata, readable by any process on the VM -- the same trust domain that already runs
+  # arbitrary workflow code. Only done for preemptible VMs (a non-preemptible VM can never be
+  # preempted, so it gets no token). Callers should prefer a PAT they can rotate easily.
+  watcher_dereg_cmds=""
+  if [[ "${vm_teardown_action}" == "delete" ]]; then
+    watcher_dereg_cmds="agent_id=\$(grep -o '\"agentId\" *: *[0-9]*' /actions-runner/.runner 2>/dev/null | tr -cd '0-9')
+	if [ -n \"\${agent_id}\" ]; then
+	  echo \"Deregistering runner id \${agent_id} from GitHub ...\"
+	  curl -S -s -X DELETE -H \"authorization: Bearer ${token}\" \"https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners/\${agent_id}\" || true
+	fi"
+  fi
+
+  watcher_setup=""
+  if [[ "${preemptible}" == "true" ]]; then
+    watcher_setup="
+	cat <<-'WEOF' > /usr/bin/gce_preemption_watcher.sh
+	#!/bin/sh
+	# Long-poll until GCE announces preemption (TRUE at the start of the ~30s notice window).
+	while :; do
+	  p=\$(curl -S -s -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/preempted?wait_for_change=true&timeout_sec=300' || true)
+	  [ \"\${p}\" = \"TRUE\" ] && break
+	  sleep 1
+	done
+	echo \"Preemption notice received for ${VM_ID}; failing the active run fast.\"
+	run_id=\$(cat /actions-runner/.current-run-id 2>/dev/null)
+	[ -n \"\${run_id}\" ] || run_id=\"${GITHUB_RUN_ID}\"
+	echo \"Cancelling workflow run \${run_id} ...\"
+	curl -S -s -X POST -H \"authorization: Bearer ${token}\" \"https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/\${run_id}/cancel\" || true
+	# Fallback signal: a gracefully-stopped runner reports a shutdown to GitHub if it can.
+	timeout 10 systemctl stop 'actions.runner.*' || true
+	${watcher_dereg_cmds}
+	WEOF
+	chmod +x /usr/bin/gce_preemption_watcher.sh
+	nohup /usr/bin/gce_preemption_watcher.sh >> /var/log/gce-preemption-watcher.log 2>&1 &
 	"
   fi
 
@@ -318,11 +371,24 @@ function build_startup_script {
 	echo \"✅ Cancelling scheduled teardown of $VM_ID in ${machine_zone}!\"
 	# Stop the shutdown script
 	systemctl stop shutdown@${shutdown_timeout}.service
+	# Record the run id of the job that just started, so the preemption watcher cancels the run
+	# actually using this VM -- a pooled VM serves many runs, and the run id baked at
+	# create/resume time goes stale as soon as a later run's job lands here. (JOB_STARTED hooks
+	# run with the job's environment, so GITHUB_RUN_ID is the current run's id.) The if-form
+	# (not [ ] && ...) matters: a bare && chain as the script's last line would exit nonzero when
+	# the variable is empty, and a failing JOB_STARTED hook fails the job itself.
+	if [ -n \"\${GITHUB_RUN_ID}\" ]; then
+	  echo \"\${GITHUB_RUN_ID}\" > /actions-runner/.current-run-id
+	fi
 	EOF
 
 	# See: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job
 	echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/bin/gce_runner_shutdown.sh" >.env
   echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/bin/gce_cancel_shutdown.sh" >>.env
+	# Seed with the run id known at create/resume time; the JOB_STARTED hook above refreshes it
+	# per job so the preemption watcher always cancels the run actually using this VM.
+	echo "${GITHUB_RUN_ID}" > /actions-runner/.current-run-id
+	${watcher_setup}
 	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \\
 	${sanitize_cmds}if [ ! -f /actions-runner/.runner ]; then
 	  ${runner_download_cmds}RUNNER_ALLOW_RUNASROOT=1 ./config.sh --url https://github.com/${GITHUB_REPOSITORY} --token ${RUNNER_TOKEN} --labels ${VM_ID} --unattended --replace ${ephemeral_flag} --disableupdate && \\

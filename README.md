@@ -327,23 +327,32 @@ value consistently to `delete` as well.
 preemptible: same discounts, same preemption mechanics, no 24h forced-stop cap). When GCE
 preempts a runner mid-job:
 
-* **The job fails fast.** The VM's shutdown-script gracefully stops the runner service inside
-  the ~30-second preemption window, so the runner tells GitHub it's going away and the job fails
-  within seconds with "The runner has received a shutdown signal" — instead of hanging ~10
-  minutes until GitHub's lost-communication timeout. This applies to ephemeral and pooled
-  runners alike.
+* **The workflow run is cancelled within seconds.** A preemption watcher on the VM long-polls
+  the metadata server's `instance/preempted` endpoint, which GCE flips at the very start of the
+  preemption notice — while the network is still fully up. The watcher cancels the active
+  workflow run via the GitHub API (deterministic and server-side, no dependence on the dying
+  VM's teardown races), then also stops the runner service as a fallback signal. Without this,
+  a preempted job just spins until GitHub's ~10-minute lost-communication timeout. This applies
+  to ephemeral and pooled runners alike. The watcher always cancels the run whose job is
+  actually executing on the VM — the job-started hook records the current run id on every job,
+  so a pooled VM serving many runs cancels the right one.
 * **Ephemeral VMs are deleted by GCE itself** (`--instance-termination-action=DELETE`), entirely
   server-side — a preempted ephemeral runner can never linger as a zombie TERMINATED instance,
-  even if the guest gets no shutdown window at all. Its GitHub runner registration is not
-  removed at preemption time (doing so would require baking a token into the VM); GitHub
-  auto-purges offline ephemeral registrations after 1 day.
+  even if the guest gets no shutdown window at all. The watcher also deregisters the runner from
+  GitHub (ephemeral registrations can never be reused; GitHub's own auto-purge of offline
+  ephemeral runners after 1 day serves as the backstop if the window closes first).
 * **Pooled persistent VMs are stopped, not deleted** (`--instance-termination-action=STOP`) —
-  disk state survives, the registration stays valid, and the next `start` with the same
-  `reuse_key` resumes the VM and reconnects the same runner.
+  disk state survives, the runner registration is deliberately left intact, and the next `start`
+  with the same `reuse_key` resumes the VM and reconnects the same runner.
 
-Preemption still fails the workflow run that was interrupted — these mechanics only guarantee
-prompt failure and clean resource teardown, not retry. Pair with `machine_zones` (above) so the
-retry run can land somewhere with capacity.
+**Security trade-off**: to make the API cancellation possible, the `token` input is baked into a
+preemptible VM's startup-script metadata, which is readable by any process on the VM — the same
+trust domain that already runs your workflow code. Non-preemptible VMs never receive the token.
+Use a PAT you can rotate easily, scoped as tightly as your setup allows.
+
+Note the run interrupted by preemption ends **cancelled**, not failed — these mechanics guarantee
+prompt termination and clean resource teardown, not retry. Pair with `machine_zones` (above) so
+the retry run can land somewhere with capacity.
 
 ## Example Workflows
 
